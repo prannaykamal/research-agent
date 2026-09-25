@@ -1,0 +1,9 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "create_analysts": "./src/agent.py:graph",
+    "asnwer_question": "./src/answering_questions.py:question_answer_graph",
+    "deep_agent": "./src/deep_agent.py:graph"
+  },
+  "env": ".env"
+}
