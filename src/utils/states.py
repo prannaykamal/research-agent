@@ -1,34 +1,45 @@
-from typing_extensions import NotRequired, TypedDict
-from typing import List, Optional
-from src.utils.objects import Analyst
-from langgraph.graph import MessagesState
-from typing_extensions import Annotated
 import operator
-from pydantic import BaseModel, Field
+from typing import List, Optional
+
+from langchain_core.messages import AnyMessage
+from langgraph.graph import add_messages
+from typing_extensions import Annotated, NotRequired, TypedDict
+
+from src.utils.objects import Analyst, ResearchEvaluation, ResearchFinding
+
 
 class GenerateAnalystsState(TypedDict):
-    topic: str # Research topic
-    max_analysts: int # Number of analysts
-    human_analyst_feedback: NotRequired[Optional[str]] # Human feedback
-    analysts: NotRequired[List[Analyst]] # Analyst asking questions
+    topic: str
+    max_analysts: int
+    human_analyst_feedback: NotRequired[Optional[str]]
+    analysts: NotRequired[List[Analyst]]
 
-class InterviewState(MessagesState):
-    max_num_turns: int # Number turns of conversation
-    context: Annotated[list, operator.add] # Source docs
-    analyst: Analyst # Analyst asking questions
-    interview: str # Interview transcript
-    sections: list # Final key we duplicate in outer state for Send() API
 
-class SearchQuery(BaseModel):
-    search_query: str = Field(None, description="Search query for retrieval.")
+class AnalystResearchState(TypedDict):
+    """Durable analyst evidence plus the current pass's temporary tool transcript."""
+
+    topic: str
+    analyst: Analyst
+    sub_questions: List[str]
+    question_history: Annotated[List[str], operator.add]
+    research_findings: Annotated[List[ResearchFinding], operator.add]
+    feedback: str
+    loop_count: int
+    draft: str
+
+    messages: Annotated[List[AnyMessage], add_messages]
+    tool_call_count: int
+    budget_exhausted: bool
+    evaluation: Optional[ResearchEvaluation]
+
 
 class ResearchGraphState(TypedDict):
-    topic: str # Research topic
-    max_analysts: int # Number of analysts
-    human_analyst_feedback: NotRequired[Optional[str]] # Human feedback
-    analysts: List[Analyst] # Analyst asking questions
-    sections: Annotated[list, operator.add] # Send() API key
-    introduction: str # Introduction for the final report
-    content: str # Content for the final report
-    conclusion: str # Conclusion for the final report
-    final_report: str # Final report
+    topic: str
+    max_analysts: int
+    human_analyst_feedback: NotRequired[Optional[str]]
+    analysts: List[Analyst]
+    sections: Annotated[list[str], operator.add]
+    introduction: str
+    content: str
+    conclusion: str
+    final_report: str
