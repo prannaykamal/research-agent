@@ -1,15 +1,19 @@
 import hashlib
 import json
+import logging
 import re
+import time
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+import httpx
 
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.prebuilt import ToolNode, tools_condition
 
-from src.utils.models import llm
+from src.utils.models import heavy_llm, medium_llm
 from src.utils.objects import (
     Analyst,
     ResearchEvaluation,
@@ -24,12 +28,18 @@ from src.utils.prompts import (
     researcher_instructions,
     writer_instructions,
 )
+from src.utils.nodes import _format_sections
 from src.utils.states import AnalystResearchState
 from src.utils.tools import build_research_tools
 
 
+logger = logging.getLogger(__name__)
+
 MAX_RESEARCH_LOOPS = 3
 MAX_TOOL_CALLS_PER_PASS = 6
+MAX_EXTRACTION_TOOL_OUTPUT_CHARS = 4_000
+MAX_EXTRACTION_TRANSCRIPT_CHARS = 24_000
+EXTRACTION_TIMEOUT_ATTEMPTS = 2
 TRACKING_QUERY_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid"}
 
 
@@ -39,6 +49,75 @@ def _analyst(value: Analyst | dict[str, Any]) -> Analyst:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
+
+def _decode_raw_structured_output(raw: Any) -> dict[str, Any] | None:
+    """Decode the native Gemini JSON payload returned alongside a parse failure."""
+    content = getattr(raw, "content", raw)
+    if isinstance(content, dict):
+        return content
+    if isinstance(content, list):
+        text_parts = [
+            item.get("text", "") if isinstance(item, dict) else str(item)
+            for item in content
+        ]
+        content = "".join(text_parts)
+    if not isinstance(content, str):
+        return None
+
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(content):
+        if character not in "{[":
+            continue
+        try:
+            candidate, _ = decoder.raw_decode(content[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            return candidate
+    return None
+
+
+
+def _bounded_tool_outputs(messages: list[Any]) -> list[dict[str, str]]:
+    """Keep structured extraction fast while retaining evidence from this pass only."""
+
+    outputs: list[dict[str, str]] = []
+    remaining = MAX_EXTRACTION_TRANSCRIPT_CHARS
+    for message in messages:
+        if not isinstance(message, ToolMessage) or remaining <= 0:
+            continue
+        content = str(message.content)
+        limit = min(MAX_EXTRACTION_TOOL_OUTPUT_CHARS, remaining)
+        marker = "\n[tool output truncated for evidence extraction]"
+        if len(content) > limit:
+            bounded = content[: max(0, limit - len(marker))] + marker[:limit]
+        else:
+            bounded = content
+        outputs.append({"tool_call_id": message.tool_call_id, "content": bounded})
+        remaining -= len(bounded)
+    return outputs
+def _recover_valid_findings(raw: Any) -> tuple[list[ResearchFinding], int]:
+    """Retain individually valid findings when one batch item violates the schema."""
+    payload = _decode_raw_structured_output(raw)
+    if payload is None:
+        return [], 0
+    candidates = payload.get("findings", [])
+    if not isinstance(candidates, list):
+        return [], 1
+
+    valid: list[ResearchFinding] = []
+    discarded = 0
+    for candidate in candidates:
+        try:
+            finding = ResearchFinding.model_validate(candidate)
+        except (TypeError, ValueError):
+            discarded += 1
+            continue
+        if len(valid) == 4:
+            discarded += 1
+            continue
+        valid.append(finding)
+    return valid, discarded
 
 
 def _normalise_text(value: str) -> str:
@@ -122,7 +201,7 @@ def planner_node(state: AnalystResearchState) -> dict[str, Any]:
         "question_history": state["question_history"],
         "research_findings": [finding.model_dump() for finding in state["research_findings"]],
     }
-    structured_llm = llm.with_structured_output(ResearchPlan)
+    structured_llm = heavy_llm.with_structured_output(ResearchPlan)
     plan = structured_llm.invoke(
         [
             SystemMessage(content=planner_instructions),
@@ -138,22 +217,21 @@ def planner_node(state: AnalystResearchState) -> dict[str, Any]:
             _normalise_text(item) for item in questions
         }:
             questions.append(cleaned)
-        if len(questions) == 5:
+        if len(questions) == 3:
             break
 
-    if not state["question_history"] and len(questions) < 3:
+    if len(questions) < 2:
         correction = structured_llm.invoke(
             [
                 SystemMessage(content=planner_instructions),
                 HumanMessage(
                     content=(
-                        "Return three to five distinct initial questions. Do not repeat "
+                        "Return two or three distinct additional questions. Do not repeat "
                         f"these rejected or duplicate questions: {_json(plan.sub_questions)}.\n"
                         f"Context: {_json(planner_input)}"
                     )
                 ),
-            ]
-        )
+            ], thinking_level="medium")
         for question in correction.sub_questions:
             cleaned = re.sub(r"\s+", " ", question).strip()
             normalized = _normalise_text(cleaned)
@@ -161,7 +239,7 @@ def planner_node(state: AnalystResearchState) -> dict[str, Any]:
                 _normalise_text(item) for item in questions
             }:
                 questions.append(cleaned)
-            if len(questions) == 5:
+            if len(questions) == 3:
                 break
 
     return {
@@ -178,7 +256,7 @@ def planner_node(state: AnalystResearchState) -> dict[str, Any]:
 
 def researcher_node(state: AnalystResearchState) -> dict[str, Any]:
     """Use tools only to answer the Planner's current research questions."""
-    bound_llm = llm.bind_tools(RESEARCH_TOOLS)
+    bound_llm = medium_llm.bind_tools(RESEARCH_TOOLS)
     response = bound_llm.invoke(
         [SystemMessage(content=researcher_instructions), *state["messages"]]
     )
@@ -230,34 +308,70 @@ def route_after_tools(state: AnalystResearchState) -> Literal["researcher_node",
 
 def extract_findings(state: AnalystResearchState) -> dict[str, Any]:
     """Convert one completed pass's temporary tool output into durable evidence."""
-    tool_outputs = [
-        {"tool_call_id": message.tool_call_id, "content": str(message.content)}
-        for message in state["messages"]
-        if isinstance(message, ToolMessage)
-    ]
+    tool_outputs = _bounded_tool_outputs(state["messages"])
     extraction_input = {
         "topic": state["topic"],
         "analyst": _analyst(state["analyst"]).model_dump(),
         "sub_questions": state["sub_questions"],
         "tool_outputs": tool_outputs,
     }
-    batch = llm.with_structured_output(ResearchFindingBatch).invoke(
-        [
-            SystemMessage(content=finding_extraction_instructions),
-            HumanMessage(content=_json(extraction_input)),
-        ]
+    messages = [
+        SystemMessage(content=finding_extraction_instructions),
+        HumanMessage(content=_json(extraction_input)),
+    ]
+    structured_llm = medium_llm.with_structured_output(
+        ResearchFindingBatch,
+        include_raw=True,
     )
-    additions = deduplicate_findings(state["research_findings"], batch.findings)
+
+    extraction: dict[str, Any] | None = None
+    for attempt in range(1, EXTRACTION_TIMEOUT_ATTEMPTS + 1):
+        try:
+            extraction = structured_llm.invoke(messages)
+            break
+        except httpx.TimeoutException as exc:
+            if attempt < EXTRACTION_TIMEOUT_ATTEMPTS:
+                logger.warning(
+                    "Research finding extraction timed out on attempt %d/%d; retrying: %r",
+                    attempt,
+                    EXTRACTION_TIMEOUT_ATTEMPTS,
+                    exc,
+                )
+                time.sleep(1)
+                continue
+            logger.warning(
+                "Research finding extraction timed out after %d attempts; "
+                "continuing with accumulated evidence: %r",
+                attempt,
+                exc,
+            )
+            return {"loop_count": state["loop_count"] + 1}
+
+    if extraction is None:
+        raise RuntimeError("Finding extraction completed without a result or timeout.")
+
+    batch = extraction.get("parsed")
+    if batch is None:
+        recovered, discarded = _recover_valid_findings(extraction.get("raw"))
+        logger.warning(
+            "Research finding extraction returned malformed structured output; "
+            "recovered=%d discarded=%d parsing_error=%r raw_output=%r",
+            len(recovered),
+            discarded,
+            extraction.get("parsing_error"),
+            extraction.get("raw"),
+        )
+        additions = deduplicate_findings(state["research_findings"], recovered)
+    else:
+        additions = deduplicate_findings(state["research_findings"], batch.findings)
     return {
         "research_findings": additions,
         "loop_count": state["loop_count"] + 1,
     }
-
-
 def evaluate_research(state: AnalystResearchState) -> dict[str, Any]:
     """Assess evidence coverage without tools or external retrieval."""
     analyst = _analyst(state["analyst"])
-    evaluation = llm.with_structured_output(ResearchEvaluation).invoke(
+    evaluation = heavy_llm.with_structured_output(ResearchEvaluation).invoke(
         [
             SystemMessage(content=evaluator_instructions),
             HumanMessage(
@@ -291,7 +405,7 @@ def route_evaluation(state: AnalystResearchState) -> Literal["planner_node", "wr
 def writer_node(state: AnalystResearchState) -> dict[str, str]:
     """Write from durable findings only; this model is deliberately not tool-bound."""
     analyst = _analyst(state["analyst"])
-    response = llm.invoke(
+    response = medium_llm.invoke(
         [
             SystemMessage(content=writer_instructions),
             HumanMessage(
@@ -308,7 +422,7 @@ def writer_node(state: AnalystResearchState) -> dict[str, str]:
             ),
         ]
     )
-    return {"draft": response.content}
+    return {"draft": _format_sections(response.content)}
 
 
 RESEARCH_TOOLS = build_research_tools()

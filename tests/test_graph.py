@@ -7,6 +7,7 @@ from typing_extensions import TypedDict
 
 from src.analyst_research import analyst_research_graph
 from src.utils.edges import initiate_all_research
+from src.utils.nodes import _format_sections
 from src.utils.objects import Analyst
 
 
@@ -54,3 +55,9 @@ def test_parent_send_initializes_isolated_research_state() -> None:
 
 def test_compiled_research_graph_is_available() -> None:
     assert analyst_research_graph is not None
+
+
+def test_section_formatter_flattens_parallel_reducer_output() -> None:
+    assert _format_sections(
+        [[{"text": "Draft A"}], {"draft": [{"content": "Draft B"}, "Draft C"]}]
+    ) == "Draft A\n\nDraft B\n\nDraft C"

@@ -1,7 +1,7 @@
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import interrupt
 
-from src.utils.models import llm
+from src.utils.models import light_llm, medium_llm
 from src.utils.objects import Perspectives
 from src.utils.prompts import (
     analyst_instructions,
@@ -11,8 +11,33 @@ from src.utils.prompts import (
 from src.utils.states import GenerateAnalystsState, ResearchGraphState
 
 
+def _format_sections(sections: object) -> str:
+    """Normalize reducer wrappers and Gemini content parts into report prose."""
+
+    flattened: list[str] = []
+
+    def collect(value: object) -> None:
+        if isinstance(value, str):
+            if value.strip():
+                flattened.append(value)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                collect(item)
+            return
+        if isinstance(value, dict):
+            for key in ("draft", "sections", "content", "text", "output_text"):
+                if key in value:
+                    collect(value[key])
+                    return
+            raise TypeError("Report section dictionaries must contain text or content")
+        if value is not None:
+            raise TypeError(f"Report sections must be text, not {type(value).__name__}")
+
+    collect(sections)
+    return "\n\n".join(flattened)
 def create_analysts(state: GenerateAnalystsState):
-    structured_llm = llm.with_structured_output(Perspectives)
+    structured_llm = medium_llm.with_structured_output(Perspectives)
     system_message = analyst_instructions.format(
         topic=state["topic"],
         human_analyst_feedback=state.get("human_analyst_feedback", ""),
@@ -51,34 +76,34 @@ def dummy(_: GenerateAnalystsState):
 
 
 def write_report(state: ResearchGraphState):
-    sections = "\n\n".join(state["sections"])
+    sections = _format_sections(state.get("sections", []))
     instructions = report_writer_instructions.format(topic=state["topic"], context=sections)
-    report = llm.invoke(
+    report = medium_llm.invoke(
         [SystemMessage(content=instructions), HumanMessage(content="Write the report.")]
     )
-    return {"content": report.content}
+    return {"content": _format_sections(report.content)}
 
 
 def write_introduction(state: ResearchGraphState):
-    sections = "\n\n".join(state["sections"])
+    sections = _format_sections(state.get("sections", []))
     instructions = intro_conclusion_instructions.format(
         topic=state["topic"], formatted_str_sections=sections
     )
-    intro = llm.invoke(
+    intro = light_llm.invoke(
         [SystemMessage(content=instructions), HumanMessage(content="Write the introduction.")]
     )
-    return {"introduction": intro.content}
+    return {"introduction": _format_sections(intro.content)}
 
 
 def write_conclusion(state: ResearchGraphState):
-    sections = "\n\n".join(state["sections"])
+    sections = _format_sections(state.get("sections", []))
     instructions = intro_conclusion_instructions.format(
         topic=state["topic"], formatted_str_sections=sections
     )
-    conclusion = llm.invoke(
+    conclusion = light_llm.invoke(
         [SystemMessage(content=instructions), HumanMessage(content="Write the conclusion.")]
     )
-    return {"conclusion": conclusion.content}
+    return {"conclusion": _format_sections(conclusion.content)}
 
 
 def finalize_report(state: ResearchGraphState):

@@ -35,11 +35,11 @@ class ResearchFinding(BaseModel):
 
 
 class ResearchFindingBatch(BaseModel):
-    findings: List[ResearchFinding] = Field(default_factory=list)
+    findings: List[ResearchFinding] = Field(default_factory=list, max_length=4)
 
 
 class ResearchPlan(BaseModel):
-    sub_questions: List[str] = Field(default_factory=list)
+    sub_questions: List[str] = Field(min_length=2, max_length=3)
 
 
 class ResearchEvaluation(BaseModel):

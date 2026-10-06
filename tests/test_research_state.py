@@ -1,4 +1,5 @@
-from langchain_core.messages import HumanMessage, RemoveMessage, ToolMessage
+import httpx
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
 
 import src.analyst_research as research
 from src.utils.objects import Analyst, ResearchFinding, ResearchFindingBatch, ResearchPlan
@@ -13,7 +14,7 @@ class StructuredResult:
 
 
 class PlannerModel:
-    def with_structured_output(self, schema):
+    def with_structured_output(self, schema, **_kwargs):
         assert schema is ResearchPlan
         return StructuredResult(ResearchPlan(sub_questions=["Question one", "Question two", "Question three"]))
 
@@ -36,7 +37,7 @@ def research_state():
 
 
 def test_planner_resets_only_temporary_execution_state(monkeypatch) -> None:
-    monkeypatch.setattr(research, "llm", PlannerModel())
+    monkeypatch.setattr(research, "heavy_llm", PlannerModel())
     update = research.planner_node(research_state())
 
     assert update["question_history"] == ["Question one", "Question two", "Question three"]
@@ -57,18 +58,52 @@ def test_extract_findings_runs_once_and_increments_one_pass(monkeypatch) -> None
     )
 
     class ExtractionModel:
-        def with_structured_output(self, schema):
+        def with_structured_output(self, schema, *, include_raw=False):
             assert schema is ResearchFindingBatch
-            return StructuredResult(ResearchFindingBatch(findings=[finding]))
+            assert include_raw is True
+            return StructuredResult(
+                {"parsed": ResearchFindingBatch(findings=[finding]), "parsing_error": None}
+            )
 
     state = research_state()
     state["messages"] = [ToolMessage(content="tool result", tool_call_id="call-1")]
-    monkeypatch.setattr(research, "llm", ExtractionModel())
+    monkeypatch.setattr(research, "medium_llm", ExtractionModel())
     update = research.extract_findings(state)
 
     assert update["loop_count"] == 1
     assert update["research_findings"] == [finding]
 
+
+def test_malformed_extraction_recovers_valid_findings(monkeypatch, caplog) -> None:
+    valid = {
+        "sub_question": "Question one",
+        "claim": "Supported claim",
+        "source_title": "Source",
+        "source_url": "https://example.com/evidence",
+        "excerpt": "Supporting excerpt",
+        "source_type": "web",
+    }
+    malformed = {"sub_question": "Question one", "claim": "Missing source fields"}
+
+    class MalformedExtractionModel:
+        def with_structured_output(self, schema, *, include_raw=False):
+            assert schema is ResearchFindingBatch
+            assert include_raw is True
+            raw = AIMessage(content=research._json({"findings": [valid, malformed]}))
+            return StructuredResult(
+                {"parsed": None, "parsing_error": ValueError("partial finding"), "raw": raw}
+            )
+
+    state = research_state()
+    state["messages"] = [ToolMessage(content="truncated tool result", tool_call_id="call-1")]
+    monkeypatch.setattr(research, "medium_llm", MalformedExtractionModel())
+
+    update = research.extract_findings(state)
+
+    assert update["loop_count"] == 1
+    assert update["research_findings"] == [ResearchFinding.model_validate(valid)]
+    assert "recovered=1 discarded=1" in caplog.text
+    assert "raw_output=" in caplog.text
 
 def test_writer_never_binds_tools(monkeypatch) -> None:
     from langchain_core.messages import AIMessage
@@ -78,7 +113,7 @@ def test_writer_never_binds_tools(monkeypatch) -> None:
             raise AssertionError("writer must not bind tools")
 
         def invoke(self, _messages):
-            return AIMessage(content="Evidence-grounded draft")
+            return AIMessage(content=[{"type": "text", "text": "Evidence-grounded draft"}])
 
     state = research_state()
     state["research_findings"] = [
@@ -91,6 +126,33 @@ def test_writer_never_binds_tools(monkeypatch) -> None:
             source_type="web",
         )
     ]
-    monkeypatch.setattr(research, "llm", WriterModel())
+    monkeypatch.setattr(research, "medium_llm", WriterModel())
 
     assert research.writer_node(state) == {"draft": "Evidence-grounded draft"}
+
+
+def test_extract_findings_retries_timeout_then_continues(monkeypatch, caplog) -> None:
+    class TimeoutModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def with_structured_output(self, schema, *, include_raw=False):
+            assert schema is ResearchFindingBatch
+            assert include_raw is True
+            return self
+
+        def invoke(self, _messages):
+            self.calls += 1
+            raise httpx.ReadTimeout("transient provider timeout")
+
+    model = TimeoutModel()
+    state = research_state()
+    monkeypatch.setattr(research, "medium_llm", model)
+    monkeypatch.setattr(research.time, "sleep", lambda _seconds: None)
+
+    update = research.extract_findings(state)
+
+    assert model.calls == research.EXTRACTION_TIMEOUT_ATTEMPTS
+    assert update == {"loop_count": 1}
+    assert "timed out on attempt 1/2; retrying" in caplog.text
+    assert "continuing with accumulated evidence" in caplog.text
