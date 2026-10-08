@@ -1,9 +1,11 @@
 import ipaddress
 import json
-from typing import Any
-from urllib.parse import urlsplit
+import socket
+from typing import Any, Iterable
+from urllib.parse import urljoin, urlsplit
 
-from langchain_community.document_loaders import WebBaseLoader
+import httpx
+from bs4 import BeautifulSoup
 from langchain_community.tools.arxiv import ArxivQueryRun
 from langchain_community.tools.pubmed.tool import PubmedQueryRun
 from langchain_community.tools.wikipedia.tool import WikipediaQueryRun
@@ -13,21 +15,37 @@ from langchain_tavily import TavilySearch
 
 
 MAX_TOOL_OUTPUT_CHARS = 12_000
+MAX_SCRAPE_BYTES = 2_000_000
+MAX_SCRAPE_REDIRECTS = 3
+SCRAPE_TIMEOUT_SECONDS = 15.0
+SCRAPE_USER_AGENT = "research-agent/0.1 (+https://github.com/prannaykamal/research-agent)"
 
 
-def _bounded(value: Any) -> str:
-    return str(value).strip()[:MAX_TOOL_OUTPUT_CHARS]
+def _bounded(value: Any, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
+    return str(value).strip()[:limit]
 
 
 def _source_payload(
-    *, title: str, url: str, excerpt: str, source_type: str
+    *, title: str, url: str, excerpt: str, source_type: str, limit: int = MAX_TOOL_OUTPUT_CHARS
 ) -> dict[str, str]:
     return {
         "source_title": title or "Untitled source",
         "source_url": url,
-        "excerpt": _bounded(excerpt),
+        "excerpt": _bounded(excerpt, limit),
         "source_type": source_type,
     }
+
+
+def _excerpt_limit(count: int) -> int:
+    """Share the per-tool output cap across every returned document."""
+    return MAX_TOOL_OUTPUT_CHARS // max(1, count)
+
+
+class BoundedTavilySearch(TavilySearch):
+    """Standard TavilySearch whose output is serialized and bounded like other tools."""
+
+    def _run(self, *args: Any, **kwargs: Any) -> str:
+        return _bounded(json.dumps(super()._run(*args, **kwargs), default=str))
 
 
 class WikipediaEvidenceTool(WikipediaQueryRun):
@@ -38,12 +56,14 @@ class WikipediaEvidenceTool(WikipediaQueryRun):
     def _run(self, query: str, run_manager=None) -> str:
         try:
             documents = self.api_wrapper.load(query)
+            limit = _excerpt_limit(len(documents))
             payload = [
                 _source_payload(
                     title=document.metadata.get("title", "Wikipedia"),
                     url=document.metadata.get("source", ""),
                     excerpt=document.page_content,
                     source_type="wikipedia",
+                    limit=limit,
                 )
                 for document in documents
             ]
@@ -60,12 +80,14 @@ class ArxivEvidenceTool(ArxivQueryRun):
     def _run(self, query: str, run_manager=None) -> str:
         try:
             documents = self.api_wrapper.get_summaries_as_docs(query)
+            limit = _excerpt_limit(len(documents))
             payload = [
                 _source_payload(
                     title=document.metadata.get("Title", "arXiv paper"),
                     url=document.metadata.get("Entry ID", ""),
                     excerpt=document.page_content,
                     source_type="arxiv",
+                    limit=limit,
                 )
                 for document in documents
             ]
@@ -81,65 +103,109 @@ class PubMedEvidenceTool(PubmedQueryRun):
 
     def _run(self, query: str, run_manager=None) -> str:
         try:
-            articles = self.api_wrapper.load(query)
+            articles = [article for article in self.api_wrapper.load(query) if article.get("uid")]
+            limit = _excerpt_limit(len(articles))
             payload = [
                 _source_payload(
                     title=str(article.get("Title", "PubMed article")),
                     url=f"https://pubmed.ncbi.nlm.nih.gov/{article['uid']}/",
                     excerpt=str(article.get("Summary", "")),
                     source_type="pubmed",
+                    limit=limit,
                 )
                 for article in articles
-                if article.get("uid")
             ]
             return json.dumps(payload)
         except Exception as exc:
             return f"PubMed search failed: {exc}"
 
 
+def _is_blocked_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_reserved
+        or address.is_multicast
+        or address.is_unspecified
+    )
+
+
 def _validate_public_http_url(url: str) -> str:
+    """Reject non-HTTP(S) URLs and any host that resolves to a non-public address."""
     parsed = urlsplit(url.strip())
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("URL must be an absolute HTTP(S) URL.")
     hostname = parsed.hostname.lower()
-    if hostname == "localhost":
+    if hostname == "localhost" or hostname.endswith(".localhost"):
         raise ValueError("Local URLs cannot be scraped.")
     try:
-        address = ipaddress.ip_address(hostname)
-        if address.is_private or address.is_loopback or address.is_link_local:
+        addresses = {info[4][0] for info in socket.getaddrinfo(hostname, parsed.port or None)}
+    except socket.gaierror as exc:
+        raise ValueError(f"Host could not be resolved: {hostname}") from exc
+    for address in addresses:
+        if _is_blocked_address(ipaddress.ip_address(address.split("%", 1)[0])):
             raise ValueError("Private network URLs cannot be scraped.")
-    except ValueError as exc:
-        if "cannot be scraped" in str(exc):
-            raise
-    return url
+    return url.strip()
+
+
+def _fetch_public_page(url: str) -> tuple[str, str]:
+    """Fetch a page, validating every redirect hop; return (final URL, HTML)."""
+    current = _validate_public_http_url(url)
+    with httpx.Client(
+        follow_redirects=False,
+        timeout=SCRAPE_TIMEOUT_SECONDS,
+        headers={"User-Agent": SCRAPE_USER_AGENT},
+    ) as client:
+        for _ in range(MAX_SCRAPE_REDIRECTS + 1):
+            with client.stream("GET", current) as response:
+                if response.is_redirect:
+                    location = response.headers.get("location", "")
+                    current = _validate_public_http_url(urljoin(current, location))
+                    continue
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "")
+                if "html" not in content_type and "text" not in content_type:
+                    raise ValueError(f"Unsupported content type: {content_type or 'unknown'}")
+                body = bytearray()
+                for chunk in response.iter_bytes():
+                    body.extend(chunk)
+                    if len(body) >= MAX_SCRAPE_BYTES:
+                        break
+                return current, body.decode(response.encoding or "utf-8", errors="replace")
+    raise ValueError("Too many redirects.")
 
 
 @tool
 def scrape_webpage(url: str) -> str:
     """Fetch one public webpage and return its title, URL, and bounded text content."""
     try:
-        safe_url = _validate_public_http_url(url)
-        documents = WebBaseLoader(web_paths=(safe_url,)).load()
-        if not documents:
+        final_url, html = _fetch_public_page(url)
+        soup = BeautifulSoup(html, "html.parser")
+        for element in soup(["script", "style", "noscript"]):
+            element.decompose()
+        title = soup.title.get_text(strip=True) if soup.title else final_url
+        text = " ".join(soup.get_text(" ").split())
+        if not text:
             return "Webpage scrape returned no content."
-        document = documents[0]
         payload = _source_payload(
-            title=document.metadata.get("title", safe_url),
-            url=document.metadata.get("source", safe_url),
-            excerpt=document.page_content,
-            source_type="scraped_page",
+            title=title, url=final_url, excerpt=text, source_type="scraped_page"
         )
         return json.dumps(payload)
     except Exception as exc:
         return f"Webpage scrape failed: {exc}"
 
 
-def build_research_tools() -> list[Any]:
-    """Build the only tools exposed to the Researcher node."""
-    return [
-        TavilySearch(max_results=3),
+def build_research_tools(allowed: Iterable[str] | None = None) -> list[Any]:
+    """Build the tools exposed to the Researcher node, optionally restricted by name."""
+    tools = [
+        BoundedTavilySearch(max_results=3),
         WikipediaEvidenceTool(api_wrapper=WikipediaAPIWrapper()),
         ArxivEvidenceTool(),
         PubMedEvidenceTool(),
         scrape_webpage,
     ]
+    if allowed is None:
+        return tools
+    names = set(allowed)
+    return [tool for tool in tools if tool.name in names]

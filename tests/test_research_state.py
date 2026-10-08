@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import httpx
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
 
@@ -19,6 +21,12 @@ class PlannerModel:
         return StructuredResult(ResearchPlan(sub_questions=["Question one", "Question two", "Question three"]))
 
 
+def use_models(monkeypatch, **models) -> None:
+    """Replace the profile's models with stubs for the analyst nodes."""
+    namespace = SimpleNamespace(**{"heavy": None, "medium": None, "writer": None, "light": None, **models})
+    monkeypatch.setattr(research, "get_models", lambda _name=None: namespace)
+
+
 def research_state():
     return {
         "topic": "Topic",
@@ -37,11 +45,12 @@ def research_state():
 
 
 def test_planner_resets_only_temporary_execution_state(monkeypatch) -> None:
-    monkeypatch.setattr(research, "heavy_llm", PlannerModel())
+    use_models(monkeypatch, heavy=PlannerModel())
     update = research.planner_node(research_state())
 
     assert update["question_history"] == ["Question one", "Question two", "Question three"]
     assert update["tool_call_count"] == 0
+    assert update["researcher_turns"] == 0
     assert update["budget_exhausted"] is False
     assert isinstance(update["messages"][0], RemoveMessage)
     assert isinstance(update["messages"][1], HumanMessage)
@@ -67,7 +76,7 @@ def test_extract_findings_runs_once_and_increments_one_pass(monkeypatch) -> None
 
     state = research_state()
     state["messages"] = [ToolMessage(content="tool result", tool_call_id="call-1")]
-    monkeypatch.setattr(research, "medium_llm", ExtractionModel())
+    use_models(monkeypatch, medium=ExtractionModel())
     update = research.extract_findings(state)
 
     assert update["loop_count"] == 1
@@ -96,7 +105,7 @@ def test_malformed_extraction_recovers_valid_findings(monkeypatch, caplog) -> No
 
     state = research_state()
     state["messages"] = [ToolMessage(content="truncated tool result", tool_call_id="call-1")]
-    monkeypatch.setattr(research, "medium_llm", MalformedExtractionModel())
+    use_models(monkeypatch, medium=MalformedExtractionModel())
 
     update = research.extract_findings(state)
 
@@ -126,9 +135,12 @@ def test_writer_never_binds_tools(monkeypatch) -> None:
             source_type="web",
         )
     ]
-    monkeypatch.setattr(research, "medium_llm", WriterModel())
+    use_models(monkeypatch, writer=WriterModel())
 
-    assert research.writer_node(state) == {"draft": "Evidence-grounded draft"}
+    update = research.writer_node(state)
+
+    assert update["draft"] == "Evidence-grounded draft"
+    assert update["stop_reason"] == "max_passes"
 
 
 def test_extract_findings_retries_timeout_then_continues(monkeypatch, caplog) -> None:
@@ -147,7 +159,8 @@ def test_extract_findings_retries_timeout_then_continues(monkeypatch, caplog) ->
 
     model = TimeoutModel()
     state = research_state()
-    monkeypatch.setattr(research, "medium_llm", model)
+    state["messages"] = [ToolMessage(content="tool result", tool_call_id="call-1")]
+    use_models(monkeypatch, medium=model)
     monkeypatch.setattr(research.time, "sleep", lambda _seconds: None)
 
     update = research.extract_findings(state)

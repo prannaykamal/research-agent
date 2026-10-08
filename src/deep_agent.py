@@ -1,6 +1,7 @@
+from langchain_core.runnables import RunnableLambda
 from langgraph.graph import END, START, StateGraph
 
-from src.analyst_research import conduct_research
+from src.analyst_research import aconduct_research, conduct_research
 from src.utils.edges import initiate_all_research
 from src.utils.nodes import (
     create_analysts,
@@ -10,13 +11,18 @@ from src.utils.nodes import (
     write_introduction,
     write_report,
 )
-from src.utils.states import ResearchGraphState
+from src.utils.states import ResearchGraphState, ResearchInput
 
 
-builder = StateGraph(ResearchGraphState)
+builder = StateGraph(ResearchGraphState, input_schema=ResearchInput)
 builder.add_node("create_analysts", create_analysts)
 builder.add_node("human_feedback", human_feedback)
-builder.add_node("conduct_research", conduct_research)
+# Sync and async variants: under the LangGraph server the async one runs every
+# analyst on a dedicated executor so all of them progress in parallel.
+builder.add_node(
+    "conduct_research",
+    RunnableLambda(conduct_research, afunc=aconduct_research, name="conduct_research"),
+)
 builder.add_node("write_report", write_report)
 builder.add_node("write_introduction", write_introduction)
 builder.add_node("write_conclusion", write_conclusion)

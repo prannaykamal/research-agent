@@ -1,12 +1,10 @@
 from langchain_core.messages import AIMessage, HumanMessage
 
-from src.analyst_research import (
-    MAX_TOOL_CALLS_PER_PASS,
-    limit_tool_calls,
-    route_after_tools,
-    route_researcher,
-)
+from src.analyst_research import limit_tool_calls, route_after_tools, route_researcher
 from src.utils.objects import Analyst
+from src.utils.profiles import get_profile
+
+MAX_TOOL_CALLS_PER_PASS = get_profile("quality").max_tool_calls_per_pass
 
 
 def state_with_calls(call_count: int, used: int = 0):

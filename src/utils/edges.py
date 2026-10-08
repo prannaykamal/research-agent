@@ -1,7 +1,7 @@
-from langchain_core.messages import HumanMessage
 from langgraph.types import Send
 from typing import Literal
 
+from src.utils.profiles import DEFAULT_PROFILE
 from src.utils.states import GenerateAnalystsState, ResearchGraphState
 
 
@@ -11,16 +11,18 @@ def should_continue(state: GenerateAnalystsState) -> Literal["create_analysts", 
 
 
 def initiate_all_research(state: ResearchGraphState):
-    """Fan out one isolated bounded research subgraph per approved analyst."""
+    """Fan out one isolated bounded research subgraph per approved analyst, all at once."""
     if state.get("human_analyst_feedback"):
         return "create_analysts"
 
+    profile = state.get("model_profile") or DEFAULT_PROFILE
     return [
         Send(
             "conduct_research",
             {
                 "topic": state["topic"],
                 "analyst": analyst,
+                "model_profile": profile,
                 "sub_questions": [],
                 "question_history": [],
                 "research_findings": [],
@@ -31,6 +33,10 @@ def initiate_all_research(state: ResearchGraphState):
                 "tool_call_count": 0,
                 "budget_exhausted": False,
                 "evaluation": None,
+                "researcher_turns": 0,
+                "llm_calls": 0,
+                "input_tokens": 0,
+                "stop_reason": None,
             },
         )
         for analyst in state["analysts"]

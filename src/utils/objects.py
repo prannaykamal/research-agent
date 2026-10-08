@@ -2,6 +2,8 @@ from typing import List
 
 from pydantic import BaseModel, Field
 
+from src.utils.guardrails import MAX_FINDINGS_PER_PASS
+
 
 class Analyst(BaseModel):
     affiliation: str = Field(description="Primary affiliation of the analyst.")
@@ -21,7 +23,9 @@ class Analyst(BaseModel):
 
 class Perspectives(BaseModel):
     analysts: List[Analyst] = Field(
-        description="Comprehensive list of analysts with roles and affiliations."
+        description=(
+            "Exactly the requested number of distinct analysts with roles and affiliations."
+        )
     )
 
 
@@ -35,7 +39,7 @@ class ResearchFinding(BaseModel):
 
 
 class ResearchFindingBatch(BaseModel):
-    findings: List[ResearchFinding] = Field(default_factory=list, max_length=4)
+    findings: List[ResearchFinding] = Field(default_factory=list, max_length=MAX_FINDINGS_PER_PASS)
 
 
 class ResearchPlan(BaseModel):
