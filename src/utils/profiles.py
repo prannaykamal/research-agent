@@ -31,11 +31,14 @@ ALL_TOOLS = ("tavily_search", "wikipedia", "arxiv", "pubmed", "scrape_webpage")
 class ResearchProfile:
     name: str
     heavy: ModelTier  # Planner, Evaluator
-    medium: ModelTier  # Analyst generation, Researcher, extraction, report synthesis
+    medium: ModelTier  # Researcher, extraction, report synthesis
     writer: ModelTier  # Analyst section writer (length-capped)
     light: ModelTier  # Introduction, conclusion
+    panel: ModelTier  # Question decomposition and analyst personas
     max_research_loops: int
     max_tool_calls_per_pass: int
+    # The Researcher is nudged to search again until it reaches this many calls.
+    min_tool_calls_per_pass: int
     max_researcher_turns: int
     analyst_deadline_seconds: float
     analyst_input_token_budget: int
@@ -81,8 +84,10 @@ def _build_profiles() -> dict[str, ResearchProfile]:
         medium=_tier("quality", "medium", "gemini-3.8-flash", 16_384, None, 120.0, legacy_override=True),
         writer=_tier("quality", "writer", "gemini-3.8-flash", 4_096, "low", 120.0),
         light=_tier("quality", "light", "gemini-3.8-flash", 8_192, None, 45.0, legacy_override=True),
+        panel=_tier("quality", "panel", "gemini-3.8-flash", 16_384, None, 120.0),
         max_research_loops=3,
         max_tool_calls_per_pass=6,
+        min_tool_calls_per_pass=4,
         max_researcher_turns=3,
         analyst_deadline_seconds=400.0,
         analyst_input_token_budget=150_000,
@@ -100,16 +105,21 @@ def _build_profiles() -> dict[str, ResearchProfile]:
         medium=_tier("fast", "medium", "gemini-3.5-flash-lite", 8_192, "minimal", 45.0),
         writer=_tier("fast", "writer", "gemini-3.5-flash-lite", 2_048, "minimal", 45.0),
         light=_tier("fast", "light", "gemini-3.5-flash-lite", 2_048, "minimal", 30.0),
-        max_research_loops=2,
-        max_tool_calls_per_pass=4,
-        max_researcher_turns=2,
-        analyst_deadline_seconds=150.0,
-        analyst_input_token_budget=60_000,
-        max_llm_calls_per_analyst=12,
+        # Personas and requirements set the shape of the whole run, so fast
+        # writes them with Flash rather than Flash-Lite.
+        panel=_tier("fast", "panel", "gemini-3.8-flash", 8_192, "low", 45.0),
+        # Same research depth as quality; fast differs in models, tools and length.
+        max_research_loops=3,
+        max_tool_calls_per_pass=6,
+        min_tool_calls_per_pass=4,
+        max_researcher_turns=3,
+        analyst_deadline_seconds=300.0,
+        analyst_input_token_budget=150_000,
+        max_llm_calls_per_analyst=25,
         researcher_tool_view_chars=1_500,
         extraction_tool_output_chars=3_000,
-        extraction_transcript_chars=12_000,
-        writer_word_target=350,
+        extraction_transcript_chars=18_000,
+        writer_word_target=500,
         allowed_tools=("tavily_search", "wikipedia", "arxiv", "pubmed"),
         min_pass_seconds=15.0,
     )
@@ -132,6 +142,7 @@ class ProfileModels:
     medium: RateLimitedRunnable
     writer: RateLimitedRunnable
     light: RateLimitedRunnable
+    panel: RateLimitedRunnable
 
 
 _models: dict[str, ProfileModels] = {}
@@ -148,6 +159,7 @@ def get_models(name: str | None = None) -> ProfileModels:
                 medium=build_model(profile.medium),
                 writer=build_model(profile.writer),
                 light=build_model(profile.light),
+                panel=build_model(profile.panel),
             )
         return _models[profile.name]
 

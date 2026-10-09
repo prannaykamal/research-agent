@@ -343,6 +343,18 @@ export function configSection({ meta, values, onStart, onReset }) {
 
 // -- human feedback
 
+// The parts of the question this analyst is responsible for answering.
+function requirementList(analyst) {
+  const requirements = Array.isArray(analyst.requirements) ? analyst.requirements : [];
+  if (!requirements.length) return null;
+  return h(
+    "div",
+    { class: "analyst-card-reqs" },
+    h("div", { class: "analyst-card-reqs-label" }, "Owns"),
+    h("ul", {}, requirements.map((requirement) => h("li", {}, requirement))),
+  );
+}
+
 export function analystGrid(analysts) {
   return h(
     "div",
@@ -355,6 +367,7 @@ export function analystGrid(analysts) {
         h("div", { class: "analyst-card-role" }, analyst.role),
         h("div", { class: "analyst-card-aff" }, analyst.affiliation),
         h("p", { class: "analyst-card-desc" }, analyst.description),
+        requirementList(analyst),
       ),
     ),
   );

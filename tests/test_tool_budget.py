@@ -1,6 +1,11 @@
 from langchain_core.messages import AIMessage, HumanMessage
 
-from src.analyst_research import limit_tool_calls, route_after_tools, route_researcher
+from src.analyst_research import (
+    limit_tool_calls,
+    max_researcher_turns,
+    route_after_tools,
+    route_researcher,
+)
 from src.utils.objects import Analyst
 from src.utils.profiles import get_profile
 
@@ -28,8 +33,30 @@ def state_with_calls(call_count: int, used: int = 0):
     }
 
 
-def test_zero_requested_calls_goes_to_extraction() -> None:
-    assert route_researcher(state_with_calls(0)) == "extract_findings"
+MIN_TOOL_CALLS_PER_PASS = get_profile("quality").min_tool_calls_per_pass
+MAX_RESEARCHER_TURNS = get_profile("quality").max_researcher_turns
+
+
+def test_zero_requested_calls_goes_to_extraction_once_the_floor_is_met() -> None:
+    assert route_researcher(state_with_calls(0, MIN_TOOL_CALLS_PER_PASS)) == "extract_findings"
+
+
+def test_stopping_below_the_search_floor_sends_the_researcher_back() -> None:
+    state = {**state_with_calls(0, 1), "researcher_turns": 1}
+    assert route_researcher(state) == "researcher_node"
+
+
+def test_search_floor_outlasts_the_turn_cap_until_the_extended_limit() -> None:
+    profile = get_profile("quality")
+    at_cap = {**state_with_calls(0, 1), "researcher_turns": MAX_RESEARCHER_TURNS}
+    assert route_researcher(at_cap) == "researcher_node"
+    extended = {**state_with_calls(0, 1), "researcher_turns": max_researcher_turns(profile)}
+    assert route_researcher(extended) == "extract_findings"
+
+
+def test_turn_cap_applies_once_the_floor_is_met() -> None:
+    state = {**state_with_calls(0, MIN_TOOL_CALLS_PER_PASS), "researcher_turns": MAX_RESEARCHER_TURNS}
+    assert route_researcher(state) == "extract_findings"
 
 
 def test_zero_remaining_budget_goes_to_extraction() -> None:

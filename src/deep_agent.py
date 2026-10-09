@@ -35,10 +35,12 @@ builder.add_conditional_edges(
     initiate_all_research,
     {"create_analysts": "create_analysts", "conduct_research": "conduct_research"},
 )
+# The introduction and conclusion summarize the finished report body, so they
+# inherit its reconciled figures and hedges rather than re-reading raw sections.
 builder.add_edge("conduct_research", "write_report")
-builder.add_edge("conduct_research", "write_introduction")
-builder.add_edge("conduct_research", "write_conclusion")
-builder.add_edge(["write_conclusion", "write_report", "write_introduction"], "finalize_report")
+builder.add_edge("write_report", "write_introduction")
+builder.add_edge("write_report", "write_conclusion")
+builder.add_edge(["write_conclusion", "write_introduction"], "finalize_report")
 builder.add_edge("finalize_report", END)
 
 graph = builder.compile()

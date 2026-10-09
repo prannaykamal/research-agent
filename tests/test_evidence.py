@@ -26,3 +26,38 @@ def test_deduplicate_findings_uses_canonical_url_and_evidence() -> None:
 
     assert additions == [distinct.model_copy(update={"source_url": "https://example.com/report"})]
     assert evidence_key(original) == evidence_key(duplicate)
+
+
+def test_source_tier_flags_the_sources_behind_past_correctness_failures() -> None:
+    from src.utils.tools import source_tier
+
+    for url in (
+        "https://brewminate.com/the-industrial-revolution",
+        "https://simple.wikipedia.org/wiki/Organic_chemistry",
+        "https://www.youtube.com/watch?v=abc",
+        "https://symbiosisonlinepublishing.com/vaccines/paper.php",
+    ):
+        assert source_tier(url) == "low", url
+    for url in (
+        "https://arxiv.org/abs/2401.00001",
+        "https://doi.org/10.1038/nature12345",
+        "https://pubmed.ncbi.nlm.nih.gov/123/",
+        "https://www.nasa.gov/missions",
+        "https://link.springer.com/article/1",
+    ):
+        assert source_tier(url) == "trusted", url
+    # Tertiary references and unknown sites warrant a spot-check, not trust.
+    assert source_tier("https://en.wikipedia.org/wiki/Fusion_power") == "verify"
+    assert source_tier("https://example.com/post") == "verify"
+
+
+def test_deduplication_prefers_trusted_sources_at_capacity() -> None:
+    from src.utils.guardrails import MAX_FINDINGS_PER_ANALYST
+
+    existing = [finding(f"https://example.com/{index}", claim=f"Old {index}") for index in range(MAX_FINDINGS_PER_ANALYST - 1)]
+    weak = finding("https://brewminate.com/claim", claim="Weak")
+    strong = finding("https://arxiv.org/abs/1", claim="Strong")
+
+    assert deduplicate_findings(existing, [weak, strong]) == [strong]
+    # With room for both, extraction order is kept.
+    assert deduplicate_findings([], [weak, strong]) == [weak, strong]

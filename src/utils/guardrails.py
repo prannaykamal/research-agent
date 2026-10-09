@@ -4,8 +4,10 @@ Profile-specific limits (passes, tool calls, deadlines, budgets) live on
 ``ResearchProfile``; the constants here apply to every profile.
 """
 
+import re
 import time
-from typing import Any, Mapping
+from datetime import date
+from typing import Any, Mapping, Sequence
 
 # System-wide limits.
 MIN_ANALYSTS = 1
@@ -25,6 +27,21 @@ MAX_SECTION_CHARS = 8_000
 MAX_SYNTHESIS_INPUT_CHARS = MAX_ANALYSTS * MAX_SECTION_CHARS
 
 TRUNCATION_MARKER = " […]"
+
+# A run whose research tool calls mostly failed gets a coverage note.
+MAX_TOOL_ERROR_SHARE = 0.5
+
+# Evidence newer than this counts as current for status claims.
+RECENT_EVIDENCE_DAYS = 365
+_SOURCE_DATE = re.compile(r"^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$")
+
+# Question decomposition: the requirements a complete answer must cover.
+MAX_REQUIREMENTS = 8
+REQUIREMENT_MATCH_THRESHOLD = 0.6
+_REQUIREMENT_STOPWORDS = frozenset(
+    "a an and are as at be been by did do does for from has have how in is it its of on "
+    "or over that the this time to was were what when which why with".split()
+)
 
 
 def validate_max_analysts(value: Any) -> int:
@@ -66,3 +83,102 @@ def analyst_stop_reason(
     if state.get("llm_calls", 0) >= profile.max_llm_calls_per_analyst:
         return "llm_call_budget"
     return None
+
+
+def _requirement_tokens(text: str) -> set[str]:
+    # A four-character prefix is a crude stem: "evolution" and "evolved" agree.
+    return {
+        token[:4]
+        for token in re.findall(r"[a-z0-9]+", text.casefold())
+        if len(token) > 1 and token not in _REQUIREMENT_STOPWORDS
+    }
+
+
+def match_requirement(label: str, requirements: Sequence[str]) -> str | None:
+    """Map a model-written requirement label onto the canonical list, or ``None``.
+
+    Models are told to copy requirements verbatim but sometimes paraphrase, so
+    the best token overlap above a threshold also counts.
+    """
+    tokens = _requirement_tokens(label)
+    if not tokens:
+        return None
+    best, best_score = None, 0.0
+    for requirement in requirements:
+        candidate = _requirement_tokens(requirement)
+        if not candidate:
+            continue
+        score = len(tokens & candidate) / min(len(tokens), len(candidate))
+        if score > best_score:
+            best, best_score = requirement, score
+    return best if best_score >= REQUIREMENT_MATCH_THRESHOLD else None
+
+
+def assign_requirements(
+    claimed: Sequence[Sequence[str]], requirements: Sequence[str]
+) -> list[list[str]]:
+    """Canonicalize each analyst's claimed requirements and give every unowned one an owner.
+
+    An unowned requirement goes to the analyst owning the fewest, so a single
+    analyst owns them all and no part of the question goes unresearched.
+    """
+    owned: list[list[str]] = []
+    for labels in claimed:
+        canonical: list[str] = []
+        for label in labels:
+            match = match_requirement(label, requirements)
+            if match is not None and match not in canonical:
+                canonical.append(match)
+        owned.append(canonical)
+    if not owned:
+        return owned
+    taken = {requirement for analyst in owned for requirement in analyst}
+    for requirement in requirements:
+        if requirement not in taken:
+            min(owned, key=len).append(requirement)
+    order = {requirement: index for index, requirement in enumerate(requirements)}
+    return [sorted(analyst, key=order.__getitem__) for analyst in owned]
+
+
+def covered_requirements(labels: Sequence[str], owned: Sequence[str]) -> list[str]:
+    """Owned requirements that at least one finding's requirement label supports.
+
+    An unlabelled finding counts toward the requirement when the analyst owns
+    exactly one, since there is nothing else it could support.
+    """
+    covered: set[str] = set()
+    for label in labels:
+        match = match_requirement(label, owned)
+        if match is None and not label.strip() and len(owned) == 1:
+            match = owned[0]
+        if match is not None:
+            covered.add(match)
+    return [requirement for requirement in owned if requirement in covered]
+
+
+def uncovered_requirements(requirements: Sequence[str], covered: Sequence[str]) -> list[str]:
+    """Requirements, in question order, that no evidence supports."""
+    supported = set(covered)
+    return [requirement for requirement in requirements if requirement not in supported]
+
+
+def evidence_age_days(source_date: str, today: str) -> int | None:
+    """Days from a source's date to ``today``, or ``None`` when the date is unusable.
+
+    Partial dates (``YYYY`` or ``YYYY-MM``) count from their first day, so a
+    source dated only by year is never treated as newer than it might be.
+    """
+    match = _SOURCE_DATE.match(source_date.strip())
+    if not match:
+        return None
+    year, month, day = (int(part) if part else 1 for part in match.groups())
+    try:
+        return (date.fromisoformat(today) - date(year, month, day)).days
+    except ValueError:
+        return None
+
+
+def is_recent(source_date: str, today: str) -> bool | None:
+    """Whether a source is under ``RECENT_EVIDENCE_DAYS`` old; ``None`` when undated."""
+    age = evidence_age_days(source_date, today)
+    return None if age is None else age <= RECENT_EVIDENCE_DAYS

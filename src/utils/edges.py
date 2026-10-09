@@ -34,6 +34,7 @@ def initiate_all_research(state: ResearchGraphState):
                 "tool_call_count": 0,
                 "budget_exhausted": False,
                 "evaluation": None,
+                "tool_results": [],
                 "researcher_turns": 0,
                 "llm_calls": 0,
                 "input_tokens": 0,

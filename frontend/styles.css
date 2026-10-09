@@ -930,6 +930,27 @@ a:hover {
   font-size: 13px;
 }
 
+.analyst-card-reqs {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  font-size: 12.5px;
+}
+
+.analyst-card-reqs-label {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.analyst-card-reqs ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  color: var(--ink-2);
+}
+
 .operator {
   display: flex;
   flex-direction: column;

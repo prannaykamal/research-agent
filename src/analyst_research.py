@@ -28,6 +28,9 @@ from src.utils.guardrails import (
     MAX_SECTION_CHARS,
     analyst_stop_reason,
     clip_text,
+    covered_requirements,
+    is_recent,
+    match_requirement,
 )
 from src.utils.models import ANALYST_SLOTS, UsageMeter, analyst_context, current_usage
 from src.utils.objects import (
@@ -37,8 +40,10 @@ from src.utils.objects import (
     ResearchFindingBatch,
     ResearchPlan,
 )
+from src.utils import prompts
 from src.utils.profiles import DEFAULT_PROFILE, ResearchProfile, get_models, get_profile
 from src.utils.prompts import (
+    dated,
     evaluator_instructions,
     finding_extraction_instructions,
     planner_instructions,
@@ -47,7 +52,14 @@ from src.utils.prompts import (
 )
 from src.utils.nodes import _format_sections
 from src.utils.states import AnalystResearchState
-from src.utils.tools import build_research_tools
+from src.utils.tools import (
+    TIER_RANK,
+    ToolAuthError,
+    auth_failure,
+    build_research_tools,
+    source_tier,
+    tool_failure,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -231,13 +243,15 @@ def evidence_key(finding: ResearchFinding) -> str:
 def deduplicate_findings(
     existing: list[ResearchFinding], candidates: list[ResearchFinding]
 ) -> list[ResearchFinding]:
-    """Retain unique, source-addressable, size-bounded findings without an LLM decision."""
+    """Retain unique, source-addressable, size-bounded findings without an LLM decision.
+
+    When more candidates qualify than the analyst has room for, higher-tier
+    sources win; ties keep the extraction order.
+    """
     seen = {evidence_key(finding) for finding in existing if finding.source_url.strip()}
     capacity = max(0, MAX_FINDINGS_PER_ANALYST - len(existing))
     unique: list[ResearchFinding] = []
     for finding in candidates:
-        if len(unique) >= capacity:
-            break
         if not finding.source_url.strip() or not finding.claim.strip() or not finding.excerpt.strip():
             continue
         canonical = canonicalize_url(finding.source_url)
@@ -254,7 +268,13 @@ def deduplicate_findings(
         if key not in seen:
             seen.add(key)
             unique.append(normalized)
-    return unique
+    if len(unique) <= capacity:
+        return unique
+    ranked = sorted(
+        range(len(unique)),
+        key=lambda index: (TIER_RANK[source_tier(unique[index].source_url)], index),
+    )
+    return [unique[index] for index in sorted(ranked[:capacity])]
 
 
 def _current_research_brief(state: AnalystResearchState, questions: list[str]) -> str:
@@ -335,7 +355,7 @@ def planner_node(state: AnalystResearchState) -> dict[str, Any]:
     plan = _parse_structured(
         structured_llm.invoke(
             [
-                SystemMessage(content=planner_instructions),
+                SystemMessage(content=dated(planner_instructions)),
                 HumanMessage(content=_json(planner_input)),
             ]
         ),
@@ -349,7 +369,7 @@ def planner_node(state: AnalystResearchState) -> dict[str, Any]:
         correction = _parse_structured(
             structured_llm.invoke(
                 [
-                    SystemMessage(content=planner_instructions),
+                    SystemMessage(content=dated(planner_instructions)),
                     HumanMessage(
                         content=(
                             "Return two or three distinct additional questions. Do not repeat "
@@ -409,17 +429,54 @@ def researcher_node(state: AnalystResearchState) -> dict[str, Any]:
         turn=state.get("researcher_turns", 0) + 1,
     )
     bound_llm = _models(state).medium.bind_tools(list(_profile_tools(profile.name)))
+    nudge = _search_floor_nudge(state, profile)
+    transcript = [*state["messages"], *([nudge] if nudge else [])]
     response = bound_llm.invoke(
         [
-            SystemMessage(content=researcher_instructions),
-            *_researcher_view(state["messages"], profile.researcher_tool_view_chars),
+            SystemMessage(content=dated(researcher_instructions)),
+            *_researcher_view(transcript, profile.researcher_tool_view_chars),
         ]
     )
     return {
-        "messages": [response],
+        "messages": [*([nudge] if nudge else []), response],
         "researcher_turns": state.get("researcher_turns", 0) + 1,
         **_usage_update(),
     }
+
+
+def _search_floor_nudge(state: AnalystResearchState, profile: ResearchProfile) -> HumanMessage | None:
+    """Ask a Researcher that stopped below the per-pass search floor to keep going.
+
+    Cheaper research models tend to stop after one or two searches, which left
+    whole requirements answered by a single finding.
+    """
+    last = state["messages"][-1] if state["messages"] else None
+    if not isinstance(last, AIMessage) or last.tool_calls:
+        return None
+    focus = _requirements_needing_evidence(state) or list(state["sub_questions"])
+    return HumanMessage(
+        content=(
+            f"You have made {state['tool_call_count']} of at least "
+            f"{profile.min_tool_calls_per_pass} searches this pass. Search again with different "
+            f"queries, prioritising: {'; '.join(focus)}. You may call several tools in one turn."
+        )
+    )
+
+
+def _turn_limit(state: AnalystResearchState, profile: ResearchProfile) -> int:
+    """Researcher turns allowed this pass.
+
+    Below the search floor an analyst gets enough turns to reach it one search
+    at a time; otherwise the profile's turn cap ended passes at three searches.
+    """
+    if state["tool_call_count"] < profile.min_tool_calls_per_pass:
+        return max_researcher_turns(profile)
+    return profile.max_researcher_turns
+
+
+def max_researcher_turns(profile: ResearchProfile) -> int:
+    """The most Researcher turns any pass can take, including the search-floor extension."""
+    return max(profile.max_researcher_turns, profile.min_tool_calls_per_pass)
 
 
 def _last_ai_message(state: AnalystResearchState) -> AIMessage | None:
@@ -429,12 +486,22 @@ def _last_ai_message(state: AnalystResearchState) -> AIMessage | None:
     return None
 
 
-def route_researcher(state: AnalystResearchState) -> Literal["limit_tool_calls", "extract_findings"]:
+def route_researcher(
+    state: AnalystResearchState,
+) -> Literal["limit_tool_calls", "researcher_node", "extract_findings"]:
     profile = _profile(state)
     message = _last_ai_message(state)
     requested = len(message.tool_calls) if message else 0
     remaining = profile.max_tool_calls_per_pass - state["tool_call_count"]
-    if requested == 0 or remaining <= 0 or analyst_stop_reason(state, profile):
+    if remaining <= 0 or analyst_stop_reason(state, profile):
+        return "extract_findings"
+    if requested == 0:
+        # Below the search floor with turns left: send the Researcher back.
+        if (
+            state["tool_call_count"] < profile.min_tool_calls_per_pass
+            and state.get("researcher_turns", 0) < _turn_limit(state, profile)
+        ):
+            return "researcher_node"
         return "extract_findings"
     return "limit_tool_calls"
 
@@ -462,12 +529,38 @@ def route_limited_tools(state: AnalystResearchState) -> Literal["tools", "extrac
     return "tools" if decision == "tools" else "extract_findings"
 
 
+def _pass_tool_results(messages: list[Any]) -> list[dict[str, Any]]:
+    """One entry per tool result in this pass, recording whether it failed.
+
+    Every tool reports failure as text rather than raising, so a run that is
+    silently degraded (for example by a revoked key) would otherwise look healthy.
+    """
+    return [
+        {
+            "tool": message.name or "unknown",
+            "failed": tool_failure(message.content, message.status) is not None,
+        }
+        for message in messages
+        if isinstance(message, ToolMessage)
+    ]
+
+
+def _raise_on_auth_failure(messages: list[Any]) -> None:
+    """Stop the analyst at once when a keyed service rejects its credentials."""
+    for message in messages:
+        if isinstance(message, ToolMessage):
+            failure = auth_failure(message.name or "", message.content, message.status)
+            if failure:
+                raise ToolAuthError(message.name or "unknown", failure)
+
+
 def route_after_tools(state: AnalystResearchState) -> Literal["researcher_node", "extract_findings"]:
+    _raise_on_auth_failure(state["messages"])
     profile = _profile(state)
     if (
         state["budget_exhausted"]
         or state["tool_call_count"] >= profile.max_tool_calls_per_pass
-        or state.get("researcher_turns", 0) >= profile.max_researcher_turns
+        or state.get("researcher_turns", 0) >= _turn_limit(state, profile)
         or analyst_stop_reason(state, profile)
     ):
         return "extract_findings"
@@ -477,13 +570,15 @@ def route_after_tools(state: AnalystResearchState) -> Literal["researcher_node",
 def extract_findings(state: AnalystResearchState) -> dict[str, Any]:
     """Convert one completed pass's temporary tool output into durable evidence."""
     profile = _profile(state)
+    # Recorded before the Planner clears this pass's transcript.
+    tool_results = _pass_tool_results(state["messages"])
     tool_outputs = _bounded_tool_outputs(
         state["messages"],
         profile.extraction_tool_output_chars,
         profile.extraction_transcript_chars,
     )
     if not tool_outputs:
-        return {"loop_count": state["loop_count"] + 1}
+        return {"loop_count": state["loop_count"] + 1, "tool_results": tool_results}
     _emit_step(
         state,
         "extract_findings",
@@ -497,7 +592,7 @@ def extract_findings(state: AnalystResearchState) -> dict[str, Any]:
         "tool_outputs": tool_outputs,
     }
     messages = [
-        SystemMessage(content=finding_extraction_instructions),
+        SystemMessage(content=dated(finding_extraction_instructions)),
         HumanMessage(content=_json(extraction_input)),
     ]
     structured_llm = _models(state).medium.with_structured_output(
@@ -526,7 +621,11 @@ def extract_findings(state: AnalystResearchState) -> dict[str, Any]:
                 attempt,
                 exc,
             )
-            return {"loop_count": state["loop_count"] + 1, **_usage_update()}
+            return {
+                "loop_count": state["loop_count"] + 1,
+                "tool_results": tool_results,
+                **_usage_update(),
+            }
 
     if extraction is None:
         raise RuntimeError("Finding extraction completed without a result or timeout.")
@@ -548,6 +647,7 @@ def extract_findings(state: AnalystResearchState) -> dict[str, Any]:
     return {
         "research_findings": additions,
         "loop_count": state["loop_count"] + 1,
+        "tool_results": tool_results,
         **_usage_update(),
     }
 def evaluate_research(state: AnalystResearchState) -> dict[str, Any]:
@@ -564,7 +664,7 @@ def evaluate_research(state: AnalystResearchState) -> dict[str, Any]:
     evaluation = _parse_structured(
         structured_llm.invoke(
             [
-                SystemMessage(content=evaluator_instructions),
+                SystemMessage(content=dated(evaluator_instructions)),
                 HumanMessage(
                     content=_json(
                         {
@@ -572,10 +672,7 @@ def evaluate_research(state: AnalystResearchState) -> dict[str, Any]:
                             "analyst": analyst.model_dump(),
                             "current_sub_questions": state["sub_questions"],
                             "question_history": state["question_history"],
-                            "research_findings": [
-                                finding.model_dump()
-                                for finding in state["research_findings"]
-                            ],
+                            "research_findings": _annotated_findings(state["research_findings"]),
                         }
                     )
                 ),
@@ -589,7 +686,76 @@ def evaluate_research(state: AnalystResearchState) -> dict[str, Any]:
             is_complete=False,
             feedback="Broaden coverage of the analyst's core concerns with new sources.",
         )
+    needing = _requirements_needing_evidence(state, evaluation)
+    if evaluation.is_complete and needing:
+        # Evidence that satisfies the persona is not enough: every owned
+        # requirement must be supported, not merely touched, while budget remains.
+        evaluation = evaluation.model_copy(
+            update={
+                "is_complete": False,
+                "coverage_gaps": [*evaluation.coverage_gaps, *needing],
+                "feedback": (
+                    f"Still lacking enough evidence: {'; '.join(needing)}. {evaluation.feedback}"
+                ).strip(),
+            }
+        )
     return {"evaluation": evaluation, "feedback": evaluation.feedback, **_usage_update()}
+
+
+def _annotated_findings(findings: list[ResearchFinding]) -> list[dict[str, Any]]:
+    """Findings with their source tier and whether the source is recent.
+
+    ``recent`` is computed here rather than by the model, which otherwise
+    presents years-old status evidence as current.
+    """
+    today = prompts.current_date()
+    return [
+        {
+            **finding.model_dump(),
+            "source_tier": source_tier(finding.source_url),
+            "recent": is_recent(finding.source_date, today),
+        }
+        for finding in findings
+    ]
+
+
+def _unsupported_requirements(state: AnalystResearchState) -> list[str]:
+    """The analyst's owned requirements that no finding supports yet."""
+    owned = _analyst(state["analyst"]).requirements
+    covered = covered_requirements(
+        [finding.requirement for finding in state["research_findings"]], owned
+    )
+    return [requirement for requirement in owned if requirement not in covered]
+
+
+def requirement_verdicts(evaluation: Any, owned: list[str]) -> dict[str, str]:
+    """The evaluator's per-requirement statuses, keyed by canonical requirement text."""
+    verdicts: dict[str, str] = {}
+    for item in getattr(evaluation, "requirement_status", None) or []:
+        match = match_requirement(item.requirement, owned)
+        if match is not None:
+            verdicts[match] = item.status
+    return verdicts
+
+
+def _requirements_needing_evidence(
+    state: AnalystResearchState, evaluation: Any = None
+) -> list[str]:
+    """Owned requirements with no finding, or that the evaluator marked thin or missing.
+
+    One finding is not enough: a "changed since X" requirement answered only
+    with today's figures is thin, and research continues while budget allows.
+    """
+    owned = _analyst(state["analyst"]).requirements
+    verdicts = requirement_verdicts(
+        evaluation if evaluation is not None else state.get("evaluation"), owned
+    )
+    unfound = set(_unsupported_requirements(state))
+    return [
+        requirement
+        for requirement in owned
+        if requirement in unfound or verdicts.get(requirement) in ("thin", "missing")
+    ]
 
 
 def route_evaluation(state: AnalystResearchState) -> Literal["planner_node", "writer_node"]:
@@ -621,17 +787,14 @@ def writer_node(state: AnalystResearchState) -> dict[str, Any]:
     response = _models(state).writer.invoke(
         [
             SystemMessage(
-                content=writer_instructions.format(word_target=profile.writer_word_target)
+                content=dated(writer_instructions.format(word_target=profile.writer_word_target))
             ),
             HumanMessage(
                 content=_json(
                     {
                         "topic": state["topic"],
                         "analyst": analyst.model_dump(),
-                        "research_findings": [
-                            finding.model_dump()
-                            for finding in state["research_findings"]
-                        ],
+                        "research_findings": _annotated_findings(state["research_findings"]),
                     }
                 )
             ),
@@ -662,7 +825,11 @@ def build_analyst_research_graph():
     builder.add_conditional_edges(
         "researcher_node",
         route_researcher,
-        {"limit_tool_calls": "limit_tool_calls", "extract_findings": "extract_findings"},
+        {
+            "limit_tool_calls": "limit_tool_calls",
+            "researcher_node": "researcher_node",
+            "extract_findings": "extract_findings",
+        },
     )
     builder.add_conditional_edges(
         "limit_tool_calls",
@@ -690,13 +857,32 @@ analyst_research_graph = build_analyst_research_graph()
 def analyst_recursion_limit(profile: ResearchProfile) -> int:
     """Supersteps a worst-case analyst can take under its profile's guardrails.
 
-    Each pass is the planner, up to ``max_researcher_turns`` rounds of
-    researcher -> limit_tool_calls -> tool_node, extraction and evaluation; the
-    writer runs once at the end. A small margin covers routing at the limits.
+    Each pass is the planner, up to ``max_researcher_turns(profile)`` rounds of
+    researcher -> limit_tool_calls -> tool_node (more than the profile's cap when
+    the search floor extends a pass), extraction and evaluation; the writer runs
+    once at the end. A small margin covers routing at the limits.
     The API server's default of 25 is too low for Deep Research.
     """
-    per_pass = 3 + 3 * profile.max_researcher_turns
+    per_pass = 3 + 3 * max_researcher_turns(profile)
     return profile.max_research_loops * per_pass + 1 + 5
+
+
+def _covered_for_stats(
+    analyst: Analyst, findings: list[ResearchFinding], evaluation: Any
+) -> list[str]:
+    """Owned requirements with evidence, by finding label or by the evaluator's verdict.
+
+    Finding labels alone miss evidence the extractor filed under a neighbouring
+    requirement, which produced a coverage note contradicting its own report.
+    """
+    owned = analyst.requirements
+    labelled = set(covered_requirements([finding.requirement for finding in findings], owned))
+    verdicts = requirement_verdicts(evaluation, owned)
+    return [
+        requirement
+        for requirement in owned
+        if requirement in labelled or verdicts.get(requirement) in ("supported", "thin")
+    ]
 
 
 def conduct_research(state: dict[str, Any]) -> dict[str, Any]:
@@ -718,15 +904,26 @@ def conduct_research(state: dict[str, Any]) -> dict[str, Any]:
                 {"recursion_limit": analyst_recursion_limit(get_profile(profile_name))},
             )
             sections = [result["draft"]]
-            status, stop_reason, findings = "completed", result.get("stop_reason"), len(
-                result.get("research_findings", [])
-            )
+            status, stop_reason = "completed", result.get("stop_reason")
+            findings = result.get("research_findings", [])
+            tool_results = result.get("tool_results", [])
+            evaluation = result.get("evaluation")
         except GraphBubbleUp:
             raise
+        except ToolAuthError as exc:
+            # Fail loudly: a run on a rejected key must not look like a thin success.
+            logger.error("Analyst %r stopped: %s", analyst.name, exc)
+            status, stop_reason, findings, tool_results = "failed", f"auth: {exc.tool}", [], []
+            evaluation = None
         except Exception as exc:
             logger.exception("Analyst %r failed; continuing without its section.", analyst.name)
-            status, stop_reason, findings = "failed", f"error: {type(exc).__name__}: {exc}", 0
+            status, stop_reason = "failed", f"error: {type(exc).__name__}: {exc}"
+            findings, tool_results, evaluation = [], [], None
         finished_at = time.time()
+    tool_errors: dict[str, int] = {}
+    for entry in tool_results:
+        if entry["failed"]:
+            tool_errors[entry["tool"]] = tool_errors.get(entry["tool"], 0) + 1
     stats = {
         "analyst_index": state.get("analyst_index"),
         "analyst": analyst.name,
@@ -734,7 +931,11 @@ def conduct_research(state: dict[str, Any]) -> dict[str, Any]:
         "profile": profile_name,
         "status": status,
         "stop_reason": stop_reason,
-        "findings": findings,
+        "findings": len(findings),
+        "requirements": analyst.requirements,
+        "requirements_covered": _covered_for_stats(analyst, findings, evaluation),
+        "tool_calls": len(tool_results),
+        "tool_errors": tool_errors,
         "llm_calls": meter.calls,
         "input_tokens": meter.input_tokens,
         "queued_seconds": round(started_at - queued_at, 3),

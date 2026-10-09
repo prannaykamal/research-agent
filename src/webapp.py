@@ -24,7 +24,7 @@ def _profile_summary(name: str) -> dict:
     return {
         "models": {
             tier: asdict(getattr(profile, tier))
-            for tier in ("heavy", "medium", "writer", "light")
+            for tier in ("heavy", "medium", "writer", "light", "panel")
         },
         "max_passes": profile.max_research_loops,
         "max_tool_calls_per_pass": profile.max_tool_calls_per_pass,

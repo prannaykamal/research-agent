@@ -33,11 +33,27 @@ def test_quality_profile_keeps_current_model_assignments() -> None:
 def test_fast_profile_uses_only_flash_and_flash_lite() -> None:
     fast = get_profile("fast")
     assert fast.heavy.model == "gemini-3.8-flash"
+    # Personas and requirements shape the whole run, so they use Flash, not Flash-Lite.
+    assert fast.panel.model == "gemini-3.8-flash"
     assert {fast.medium.model, fast.writer.model, fast.light.model} == {"gemini-3.5-flash-lite"}
     assert "scrape_webpage" not in fast.allowed_tools
     quality = get_profile("quality")
     assert fast.analyst_deadline_seconds < quality.analyst_deadline_seconds
-    assert fast.max_research_loops < quality.max_research_loops
+    assert fast.writer_word_target < quality.writer_word_target
+
+
+def test_both_profiles_research_to_the_same_depth() -> None:
+    fast, quality = get_profile("fast"), get_profile("quality")
+    for field in ("max_research_loops", "max_tool_calls_per_pass", "max_researcher_turns",
+                  "min_tool_calls_per_pass"):
+        assert getattr(fast, field) == getattr(quality, field), field
+    assert (fast.max_research_loops, fast.max_tool_calls_per_pass) == (3, 6)
+    for profile in (fast, quality):
+        assert 0 < profile.min_tool_calls_per_pass <= profile.max_tool_calls_per_pass
+        # Each pass: planner with its retry (2), researcher turns, extraction and
+        # evaluator (2); then the writer. The call budget must not cut a full run short.
+        per_pass = 2 + profile.max_researcher_turns + 2
+        assert profile.max_llm_calls_per_analyst >= profile.max_research_loops * per_pass + 1
 
 
 def test_default_and_unknown_profiles() -> None:

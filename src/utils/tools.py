@@ -1,7 +1,8 @@
 import ipaddress
 import json
+import re
 import socket
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 from urllib.parse import urljoin, urlsplit
 
 import arxiv
@@ -27,19 +28,135 @@ USER_AGENT = "research-agent/0.1 (+https://github.com/prannaykamal/research-agen
 wikipedia.set_user_agent(USER_AGENT)
 
 
+# Source trust tiers, mirroring the provenance tiers the report is judged by:
+# "trusted" needs no verification, "verify" warrants a spot-check, and "low"
+# (user-generated, content-farm or predatory) should never carry a headline.
+SourceTier = Literal["trusted", "verify", "low"]
+TIER_RANK: dict[str, int] = {"trusted": 0, "verify": 1, "low": 2}
+TRUSTED_SUFFIXES = (
+    ".gov", ".mil", ".edu", ".int", ".europa.eu",
+    ".gov.uk", ".ac.uk", ".nhs.uk", ".gov.au", ".edu.au", ".gc.ca", ".ac.jp", ".go.jp",
+)
+TRUSTED_DOMAINS = frozenset(
+    {
+        # Preprint archives, identifiers and indexes.
+        "arxiv.org", "biorxiv.org", "medrxiv.org", "doi.org", "ssrn.com", "nber.org",
+        "jstor.org",
+        # Peer-reviewed publishers and journals.
+        "nature.com", "science.org", "sciencedirect.com", "springer.com", "wiley.com",
+        "ieee.org", "acm.org", "nejm.org", "thelancet.com", "bmj.com", "cell.com",
+        "pnas.org", "plos.org", "oup.com", "cambridge.org", "tandfonline.com",
+        "sagepub.com", "annualreviews.org", "aps.org", "iop.org", "acs.org", "rsc.org",
+        # Intergovernmental bodies, standards bodies and research institutes.
+        "un.org", "oecd.org", "worldbank.org", "imf.org", "ipcc.ch", "iea.org",
+        "iso.org", "ietf.org", "w3.org", "rand.org",
+        # Established professional press.
+        "reuters.com", "apnews.com", "bbc.com", "bbc.co.uk", "ft.com", "economist.com",
+    }
+)
+LOW_DOMAINS = frozenset(
+    {
+        # User-generated video and social platforms.
+        "youtube.com", "youtu.be", "tiktok.com", "facebook.com", "instagram.com",
+        "x.com", "twitter.com", "reddit.com", "quora.com", "pinterest.com",
+        # Self-published blogs and simplified references.
+        "medium.com", "blogspot.com", "wordpress.com", "simple.wikipedia.org",
+        # Content farms and predatory publishers that carried claims in past runs.
+        "brewminate.com", "omicsonline.org", "symbiosisonlinepublishing.com",
+    }
+)
+# Never worth a search result: the Researcher should not spend calls on them.
+EXCLUDED_SEARCH_DOMAINS = [
+    "simple.wikipedia.org", "youtube.com", "tiktok.com", "facebook.com",
+    "instagram.com", "pinterest.com",
+]
+
+# Tools here report failure as text instead of raising, so detect it from the result.
+TOOL_FAILURE_PATTERN = re.compile(r"^\s*[\w -]+ (?:search|scrape) failed:", re.IGNORECASE)
+NO_RESULTS_MARKER = "No search results found"
+AUTH_FAILURE_PATTERN = re.compile(
+    r"\b40[13]\b|unauthori[sz]ed|forbidden|api[ _-]?key", re.IGNORECASE
+)
+# Only keyed services: a scraped site answering 403 is blocking bots, not a bad key.
+KEYED_TOOLS = frozenset({"tavily_search"})
+
+
+class ToolAuthError(RuntimeError):
+    """A keyed research service rejected its credentials."""
+
+    def __init__(self, tool: str, detail: str) -> None:
+        super().__init__(f"{tool} rejected its API key: {detail}")
+        self.tool = tool
+
+
+def _host(url: str) -> str:
+    host = (urlsplit(url.strip()).hostname or "").lower()
+    return host.removeprefix("www.")
+
+
+def _in_domains(host: str, domains: Iterable[str]) -> bool:
+    return any(host == domain or host.endswith(f".{domain}") for domain in domains)
+
+
+def source_tier(url: str) -> SourceTier:
+    """Classify a source by its domain alone; deterministic, never an LLM judgement."""
+    host = _host(url)
+    if not host or _in_domains(host, LOW_DOMAINS):
+        return "low"
+    if host.endswith(TRUSTED_SUFFIXES) or _in_domains(host, TRUSTED_DOMAINS):
+        return "trusted"
+    return "verify"
+
+
+def tool_failure(content: Any, status: str | None = None) -> str | None:
+    """Return the failure text when a tool result reports one, else ``None``.
+
+    An empty search is a normal outcome, not a failure.
+    """
+    text = str(content).strip()
+    if status == "error":
+        return None if NO_RESULTS_MARKER in text else text
+    return text if TOOL_FAILURE_PATTERN.match(text) else None
+
+
+def auth_failure(tool: str, content: Any, status: str | None = None) -> str | None:
+    """Return the failure text when a keyed service rejected its credentials."""
+    failure = tool_failure(content, status)
+    if tool in KEYED_TOOLS and failure and AUTH_FAILURE_PATTERN.search(failure):
+        return failure
+    return None
+
+
 def _bounded(value: Any, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
     return str(value).strip()[:limit]
 
 
 def _source_payload(
-    *, title: str, url: str, excerpt: str, source_type: str, limit: int = MAX_TOOL_OUTPUT_CHARS
+    *,
+    title: str,
+    url: str,
+    excerpt: str,
+    source_type: str,
+    limit: int = MAX_TOOL_OUTPUT_CHARS,
+    published: str = "",
 ) -> dict[str, str]:
-    return {
+    payload = {
         "source_title": title or "Untitled source",
         "source_url": url,
         "excerpt": _bounded(excerpt, limit),
         "source_type": source_type,
     }
+    if published:
+        # Lets the extractor date the finding, so stale status claims can be flagged.
+        payload["published"] = published
+    return payload
+
+
+def _iso_date(value: Any) -> str:
+    """A datetime as YYYY-MM-DD; empty for a missing or placeholder date (arxiv uses datetime.min)."""
+    if value is None or getattr(value, "year", 0) < 1900:
+        return ""
+    return value.date().isoformat()
 
 
 def _excerpt_limit(count: int) -> int:
@@ -48,10 +165,18 @@ def _excerpt_limit(count: int) -> int:
 
 
 class BoundedTavilySearch(TavilySearch):
-    """Standard TavilySearch whose output is serialized and bounded like other tools."""
+    """Standard TavilySearch whose output is serialized and bounded like other tools.
+
+    TavilySearch returns API errors, including a rejected key, as an
+    ``{"error": ...}`` result; report them in the same form as the other tools'
+    failures so they are counted rather than read as evidence.
+    """
 
     def _run(self, *args: Any, **kwargs: Any) -> str:
-        return _bounded(json.dumps(super()._run(*args, **kwargs), default=str))
+        result = super()._run(*args, **kwargs)
+        if isinstance(result, dict) and "error" in result:
+            return f"Tavily search failed: {result['error']}"
+        return _bounded(json.dumps(result, default=str))
 
 
 class WikipediaEvidenceTool(WikipediaQueryRun):
@@ -107,6 +232,7 @@ class ArxivEvidenceTool(ArxivQueryRun):
                     excerpt=result.summary,
                     source_type="arxiv",
                     limit=limit,
+                    published=_iso_date(result.published),
                 )
                 for result in results
             ]
@@ -131,6 +257,7 @@ class PubMedEvidenceTool(PubmedQueryRun):
                     excerpt=str(article.get("Summary", "")),
                     source_type="pubmed",
                     limit=limit,
+                    published=str(article.get("Published", "") or ""),
                 )
                 for article in articles
             ]
@@ -218,7 +345,7 @@ def scrape_webpage(url: str) -> str:
 def build_research_tools(allowed: Iterable[str] | None = None) -> list[Any]:
     """Build the tools exposed to the Researcher node, optionally restricted by name."""
     tools = [
-        BoundedTavilySearch(max_results=3),
+        BoundedTavilySearch(max_results=3, exclude_domains=EXCLUDED_SEARCH_DOMAINS),
         WikipediaEvidenceTool(api_wrapper=WikipediaAPIWrapper()),
         ArxivEvidenceTool(),
         PubMedEvidenceTool(),

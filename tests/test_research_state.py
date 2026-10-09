@@ -166,6 +166,6 @@ def test_extract_findings_retries_timeout_then_continues(monkeypatch, caplog) ->
     update = research.extract_findings(state)
 
     assert model.calls == research.EXTRACTION_TIMEOUT_ATTEMPTS
-    assert update == {"loop_count": 1}
+    assert update == {"loop_count": 1, "tool_results": [{"tool": "unknown", "failed": False}]}
     assert "timed out on attempt 1/2; retrying" in caplog.text
     assert "continuing with accumulated evidence" in caplog.text

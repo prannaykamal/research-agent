@@ -6,16 +6,20 @@ and runs one bounded evidence-gathering subgraph for each analyst, all in parall
 ## Architecture
 
 ```text
-create_analysts → human_feedback → Send(conduct_research) × N   (all N run at once)
+question → requirements → create_analysts → human_feedback → Send(conduct_research) × N   (all N run at once)
 
 Planner → Researcher ⇄ ToolNode → Extract findings → Evaluator → Planner or Writer
 
-completed analyst drafts → report + introduction + conclusion → final report + run_stats
+completed analyst drafts → report → introduction + conclusion → final report + run_stats
 ```
 
+The question is first split into the requirements a complete answer must cover, and
+every requirement is assigned to at least one analyst (a single analyst owns them all).
 Each analyst subgraph has isolated state. The Planner creates research questions, the
 Researcher alone invokes Tavily, Wikipedia, arXiv, PubMed, or the webpage scraper, the
 Evaluator identifies evidence gaps, and the Writer synthesizes only structured findings.
+The introduction and conclusion are written from the finished report body, so they
+inherit its reconciled figures and hedges.
 
 ## Run input
 
@@ -27,15 +31,16 @@ Evaluator identifies evidence gaps, and the Writer synthesizes only structured f
 
 ## Model profiles
 
-| | `quality`: high cost, high latency | `fast`: low cost, low latency |
+| | `quality`: high cost, high latency | `fast`: lower cost, lower latency |
 | --- | --- | --- |
 | Heavy (Planner, Evaluator) | `gemini-3.1-pro-preview`, thinking high | `gemini-3.8-flash`, thinking low |
-| Medium (analysts, Researcher, extraction, report) | `gemini-3.8-flash` | `gemini-3.5-flash-lite`, thinking minimal |
-| Writer (analyst section) | `gemini-3.8-flash`, thinking low, ≤600 words | `gemini-3.5-flash-lite`, ≤350 words |
+| Panel (question requirements, analyst personas) | `gemini-3.8-flash` | `gemini-3.8-flash`, thinking low |
+| Medium (Researcher, extraction, report) | `gemini-3.8-flash` | `gemini-3.5-flash-lite`, thinking minimal |
+| Writer (analyst section) | `gemini-3.8-flash`, thinking low, ≤600 words | `gemini-3.5-flash-lite`, ≤500 words |
 | Light (introduction, conclusion) | `gemini-3.8-flash` | `gemini-3.5-flash-lite` |
-| Research passes / tool calls per pass / Researcher turns | 3 / 6 / 3 | 2 / 4 / 2 |
+| Research passes / tool calls per pass (min–max) / Researcher turns | 3 / 4–6 / 3 (4 below the floor) | 3 / 4–6 / 3 (4 below the floor) |
 | Tools | all five | Tavily, Wikipedia, arXiv, PubMed |
-| Analyst deadline | 400 s | 150 s |
+| Analyst deadline | 400 s | 300 s |
 
 Override any model with `GEMINI_<PROFILE>_<TIER>_MODEL`, its thinking level with
 `GEMINI_<PROFILE>_<TIER>_THINKING` (`minimal`, `low`, `medium`, `high` or `none`), and its
@@ -76,13 +81,20 @@ The warning includes the TPM and RPM you would need.
 ### Per analyst (one `conduct_research` subgraph)
 
 - A research pass is counted only after its tool-use phase finishes.
-- At most 3 / 2 research passes, 6 / 4 tool calls per pass, and 3 / 2 Researcher turns per pass (`quality` / `fast`).
+- Both profiles research to the same depth: at most 3 passes, 6 tool calls per pass and 3 Researcher turns per pass.
+- Search floor: a Researcher that stops before 4 tool calls in a pass is sent back, with the requirements that still lack evidence. Below the floor a pass may take up to 4 Researcher turns instead of 3, so an analyst searching once per turn still reaches it. Cheaper research models otherwise stop after one or two searches.
 - Tool calls outside the profile's tool list are dropped before execution.
-- A deadline (400 s / 150 s), an input-token budget (150k / 60k), and an LLM-call budget (25 / 12). When any of them runs out, no new research starts; evidence already gathered is extracted and the section is written.
-- Tool output is capped at 12,000 characters per call, Tavily included. The Researcher sees outputs clipped to 2,000 / 1,500 characters. Extraction sees up to 4,000 / 3,000 characters per tool and 24,000 / 12,000 per pass.
+- A deadline (400 s / 300 s, `quality` / `fast`), an input-token budget (150k), and an LLM-call budget (25). When any of them runs out, no new research starts; evidence already gathered is extracted and the section is written.
+- Tool output is capped at 12,000 characters per call, Tavily included. The Researcher sees outputs clipped to 2,000 / 1,500 characters. Extraction sees up to 4,000 / 3,000 characters per tool and 24,000 / 18,000 per pass.
 - Raw tool messages are cleared before the next Planner pass; only structured evidence remains durable.
 - Findings require a source URL and are deterministically deduplicated. At most 4 per pass and 12 per analyst, with claims ≤300 and excerpts ≤500 characters.
 - If the Planner or Evaluator returns unusable structured output, a deterministic fallback is used instead of crashing.
+- The Evaluator rates every owned requirement `supported`, `thin` or `missing`, and cannot end research while any is thin, missing, or without a finding, as long as budget remains. A "changed since X" requirement stays thin until the evidence includes a value from around X.
+- Every system prompt starts with today's date, and forward-looking questions get a "current status as of today" requirement, so reports do not describe past events as future ones.
+- Findings carry a `source_date` (from arXiv and PubMed metadata, the URL path, or the source text), and the Evaluator and Writer see whether each source is under a year old. A current-status requirement stays `thin` without recent evidence, and writers give status claims "as of" the source's date, saying when the newest evidence is old.
+- Analyst personas must be three or four sentences; a panel with a description under 40 words gets one corrective retry.
+- Every source gets a deterministic trust tier from its domain (`trusted`, `verify`, `low`). When findings exceed capacity, higher tiers are kept, and the Writer must hedge any figure only `low`-tier sources support. Tavily never returns video, social or Simple-English Wikipedia pages.
+- Failed tool calls are counted per tool in `analyst_stats.tool_errors`. A keyed service rejecting its API key (Tavily 401/403) fails the analyst immediately with `stop_reason: "auth: <tool>"` instead of letting it research on a degraded evidence base.
 - Each analyst section is capped by a word target and at 8,000 characters.
 - A 429 or 5xx error is retried once through the limiters. Any remaining failure affects only that analyst: the report is still written and a coverage note names the missing perspectives.
 - The scraper only fetches public HTTP(S) hosts. Every redirect hop is resolved via DNS and rejected if it points to a private, loopback, link-local, reserved or multicast address.
@@ -94,6 +106,10 @@ The warning includes the TPM and RPM you would need.
 - At most 10 analysts run at once across all runs in the process.
 - TPM and RPM limits are enforced per model ID. Provider-side retries are disabled, so every attempt passes the limiters.
 - Synthesis input is bounded: ten capped sections always fit one report request.
+- When the analyst sections cite but the synthesized report cites fewer than 3 of their URLs inline, the report is rewritten once on the panel model. Cheaper report writers otherwise moved every citation into `## Sources`.
+- Every inline citation URL is added to `## Sources` if the report writer left it out, and a trailing horizontal rule in the body is dropped so the report never shows two in a row.
+- `## Evidence limits` loses entries that only say there are no limits or repeat a body sentence, and the heading goes when nothing remains.
+- Coverage notes are appended to the report for failed analysts, rejected API keys, and runs where more than half of all tool calls failed. Requirements with no supporting evidence by finding label or Evaluator verdict are recorded in `run_stats.uncovered_requirements` and passed to the report writer, which checks them against the sections and states real gaps under `## Evidence limits`, so a note can never contradict the report.
 - `run_stats` in the final state reports each analyst's status, stop reason, duration, LLM calls and input tokens.
 
 ## Setup

@@ -25,6 +25,7 @@ class GenerateAnalystsState(TypedDict):
     model_profile: NotRequired[ProfileName]
     human_analyst_feedback: NotRequired[Optional[str]]
     revision_count: NotRequired[int]
+    requirements: NotRequired[List[str]]
     analysts: NotRequired[List[Analyst]]
 
 
@@ -46,6 +47,8 @@ class AnalystResearchState(TypedDict):
     tool_call_count: int
     budget_exhausted: bool
     evaluation: Optional[ResearchEvaluation]
+    # One entry per tool result, kept across passes: {"tool", "failed"}.
+    tool_results: Annotated[List[dict[str, Any]], operator.add]
 
     # Per-analyst guardrail accounting.
     started_at: NotRequired[float]
@@ -61,6 +64,7 @@ class ResearchGraphState(TypedDict):
     model_profile: NotRequired[ProfileName]
     human_analyst_feedback: NotRequired[Optional[str]]
     revision_count: NotRequired[int]
+    requirements: NotRequired[List[str]]
     analysts: List[Analyst]
     sections: Annotated[list[str], operator.add]
     analyst_stats: Annotated[list[dict[str, Any]], operator.add]

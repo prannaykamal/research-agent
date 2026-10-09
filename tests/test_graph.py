@@ -61,3 +61,45 @@ def test_section_formatter_flattens_parallel_reducer_output() -> None:
     assert _format_sections(
         [[{"text": "Draft A"}], {"draft": [{"content": "Draft B"}, "Draft C"]}]
     ) == "Draft A\n\nDraft B\n\nDraft C"
+
+def test_introduction_and_conclusion_run_after_the_report() -> None:
+    from src.deep_agent import graph
+
+    edges = {(edge.source, edge.target) for edge in graph.get_graph().edges}
+    assert ("write_report", "write_introduction") in edges
+    assert ("write_report", "write_conclusion") in edges
+    assert ("conduct_research", "write_conclusion") not in edges
+    assert ("conduct_research", "write_introduction") not in edges
+
+
+def test_conclusion_summarizes_the_report_body_not_raw_sections(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import src.utils.nodes as nodes
+
+    prompts = []
+
+    class Recorder:
+        def invoke(self, messages):
+            prompts.append(messages[0].content)
+            return AIMessage(content="## Conclusion")
+
+    namespace = SimpleNamespace(heavy=None, medium=None, writer=None, light=Recorder())
+    monkeypatch.setattr(nodes, "get_models", lambda _name=None: namespace)
+    state = {
+        "topic": "Climate",
+        "sections": ["RAW SECTION: emissions rose 350 times"],
+        "content": "## Insights" + chr(10) + "RECONCILED BODY: estimates range from 180 to 3,000 times.",
+    }
+    nodes.write_conclusion(state)
+    nodes.write_introduction(state)
+    assert all("RECONCILED BODY" in prompt for prompt in prompts)
+    assert not any("RAW SECTION" in prompt for prompt in prompts)
+
+
+def test_no_report_body_skips_the_introduction_and_conclusion_models() -> None:
+    import src.utils.nodes as nodes
+
+    state = {"topic": "Climate", "sections": [], "content": nodes.NO_RESEARCH_MESSAGE}
+    assert nodes.write_introduction(state) == {"introduction": "# Climate"}
+    assert nodes.write_conclusion(state) == {"conclusion": ""}

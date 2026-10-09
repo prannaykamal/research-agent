@@ -19,7 +19,7 @@ from src.utils.guardrails import (
     analyst_stop_reason,
     validate_max_analysts,
 )
-from src.utils.objects import Analyst, Perspectives, ResearchFinding
+from src.utils.objects import Analyst, Perspectives, QuestionRequirements, ResearchFinding
 from src.utils.profiles import get_profile
 from src.utils.tools import MAX_TOOL_OUTPUT_CHARS, BoundedTavilySearch, _validate_public_http_url
 
@@ -78,19 +78,28 @@ def test_max_analysts_inside_range_is_accepted(value) -> None:
 
 
 class PanelModel:
-    def __init__(self, count: int) -> None:
+    """Answers the question decomposition, then the panel request."""
+
+    def __init__(self, count: int, requirements: list[str] | None = None) -> None:
         self.count = count
+        self.requirements = requirements or ["Requirement"]
+        self.schema = None
 
     def with_structured_output(self, schema, **_kwargs):
-        assert schema is Perspectives
+        assert schema in (Perspectives, QuestionRequirements)
+        self.schema = schema
         return self
 
     def invoke(self, _messages):
+        if self.schema is QuestionRequirements:
+            parsed = QuestionRequirements(requirements=self.requirements)
+            return {"parsed": parsed, "raw": AIMessage(content=""), "parsing_error": None}
         return Perspectives(analysts=[analyst(index) for index in range(self.count)])
 
 
-def use_node_models(monkeypatch, medium) -> None:
-    namespace = SimpleNamespace(heavy=None, medium=medium, writer=None, light=None)
+def use_node_models(monkeypatch, panel) -> None:
+    """Persona and requirement generation run on the profile's panel tier."""
+    namespace = SimpleNamespace(heavy=None, medium=None, writer=None, light=None, panel=panel)
     monkeypatch.setattr(nodes, "get_models", lambda _name=None: namespace)
 
 
@@ -187,9 +196,22 @@ def test_exhausted_deadline_skips_research_and_the_evaluator() -> None:
 
 def test_researcher_turn_cap_ends_the_pass() -> None:
     profile = get_profile("quality")
-    state = research_state(researcher_turns=profile.max_researcher_turns, tool_call_count=1)
-    assert research.route_after_tools(state) == "extract_findings"
+    floor = profile.min_tool_calls_per_pass
+    at_cap = research_state(researcher_turns=profile.max_researcher_turns, tool_call_count=floor)
+    assert research.route_after_tools(at_cap) == "extract_findings"
     assert research.route_after_tools(research_state(researcher_turns=1, tool_call_count=1)) == "researcher_node"
+
+
+def test_search_floor_extends_the_turn_cap_by_turns_not_without_limit() -> None:
+    profile = get_profile("fast")
+    # One search per turn reaches the cap below the floor: one more turn is allowed.
+    below_floor = research_state(
+        model_profile="fast", researcher_turns=profile.max_researcher_turns, tool_call_count=3
+    )
+    assert research.route_after_tools(below_floor) == "researcher_node"
+    extended = research.max_researcher_turns(profile)
+    exhausted = research_state(model_profile="fast", researcher_turns=extended, tool_call_count=3)
+    assert research.route_after_tools(exhausted) == "extract_findings"
 
 
 def test_disallowed_tools_are_dropped_for_the_fast_profile() -> None:
@@ -353,6 +375,7 @@ def test_arxiv_tool_uses_the_current_arxiv_client(monkeypatch) -> None:
     result = arxiv.Result(
         entry_id="http://arxiv.org/abs/2401.00001v1",
         updated=datetime.datetime(2024, 1, 1),
+        published=datetime.datetime(2023, 12, 30),
         title="A paper",
         authors=[arxiv.Result.Author("Ada Lovelace")],
         summary="We measure things.",
@@ -372,6 +395,7 @@ def test_arxiv_tool_uses_the_current_arxiv_client(monkeypatch) -> None:
             "source_url": "http://arxiv.org/abs/2401.00001v1",
             "excerpt": "We measure things.",
             "source_type": "arxiv",
+            "published": "2023-12-30",
         }
     ]
 
@@ -383,3 +407,186 @@ def test_wikipedia_requests_identify_this_project() -> None:
 
     assert wikipedia_client.USER_AGENT == USER_AGENT
     assert "research-agent" in USER_AGENT
+
+
+# Question requirements
+
+
+def test_unowned_requirements_go_to_the_least_loaded_analyst() -> None:
+    from src.utils.guardrails import assign_requirements
+
+    requirements = ["Evolution of fusion research", "Commercial viability", "Remaining challenges"]
+    # One analyst owns everything, however narrowly the model scoped it.
+    assert assign_requirements([["Commercial viability"]], requirements) == [requirements]
+    # Unclaimed requirements spread one per analyst; paraphrases map to the canonical text.
+    assert assign_requirements(
+        [["How fusion research has evolved"], [], []], requirements
+    ) == [["Evolution of fusion research"], ["Commercial viability"], ["Remaining challenges"]]
+
+
+def test_create_analysts_gives_a_single_analyst_every_requirement(monkeypatch) -> None:
+    requirements = ["Evolution of fusion research", "Commercial viability"]
+    use_node_models(monkeypatch, PanelModel(count=1, requirements=requirements))
+    update = nodes.create_analysts({"topic": "Fusion", "max_analysts": 1})
+    assert update["requirements"] == requirements
+    assert update["analysts"][0].requirements == requirements
+
+
+def test_panel_revision_reuses_the_original_requirements(monkeypatch) -> None:
+    use_node_models(monkeypatch, PanelModel(count=2, requirements=["Should not be asked"]))
+    update = nodes.create_analysts(
+        {"topic": "T", "max_analysts": 2, "requirements": ["Kept A", "Kept B"]}
+    )
+    assert update["requirements"] == ["Kept A", "Kept B"]
+    assert [a.requirements for a in update["analysts"]] == [["Kept A"], ["Kept B"]]
+
+
+class SatisfiedEvaluator:
+    def with_structured_output(self, _schema, **_kwargs):
+        return self
+
+    def invoke(self, _messages):
+        from src.utils.objects import ResearchEvaluation
+
+        verdict = ResearchEvaluation(is_complete=True, feedback="Looks sufficient.")
+        return {"parsed": verdict, "raw": AIMessage(content=""), "parsing_error": None}
+
+
+def test_evaluator_cannot_finish_while_an_owned_requirement_lacks_evidence(monkeypatch) -> None:
+    namespace = SimpleNamespace(heavy=SatisfiedEvaluator(), medium=None, writer=None, light=None)
+    monkeypatch.setattr(research, "get_models", lambda _name=None: namespace)
+    owner = analyst().model_copy(update={"requirements": ["Costs", "Safety"]})
+    costs = finding(1).model_copy(update={"requirement": "Costs"})
+
+    partial = research.evaluate_research(
+        research_state(analyst=owner, research_findings=[costs], loop_count=1)
+    )
+    assert partial["evaluation"].is_complete is False
+    assert "Safety" in partial["evaluation"].coverage_gaps
+    assert "Safety" in partial["feedback"]
+
+    safety = finding(2).model_copy(update={"requirement": "Safety"})
+    complete = research.evaluate_research(
+        research_state(analyst=owner, research_findings=[costs, safety], loop_count=1)
+    )
+    assert complete["evaluation"].is_complete is True
+
+
+def test_requirement_floor_never_outlasts_the_budget() -> None:
+    owner = analyst().model_copy(update={"requirements": ["Costs"]})
+    expired = research_state(analyst=owner, started_at=time.time() - 10_000, loop_count=1)
+    assert research.evaluate_research(expired) == {}
+    assert research.route_evaluation(expired) == "writer_node"
+
+
+# Tool failures
+
+
+class ToolCallingModel(WorstCaseModel):
+    """Like WorstCaseModel, but the Researcher calls the named tool."""
+
+    tool = "tavily_search"
+
+    def with_structured_output(self, schema, **_kwargs):
+        model = type(self)(schema)
+        return model
+
+    def bind_tools(self, _tools, **_kwargs):
+        model = type(self)(self.schema)
+        model.tools_bound = True
+        return model
+
+    def invoke(self, messages, *args, **kwargs):
+        if self.tools_bound:
+            call = {"name": self.tool, "args": {"query": "q"}, "id": uuid.uuid4().hex, "type": "tool_call"}
+            return AIMessage(content="", tool_calls=[call])
+        return super().invoke(messages, *args, **kwargs)
+
+
+def run_analyst_with_tool(monkeypatch, model) -> dict:
+    namespace = SimpleNamespace(heavy=model, medium=model, writer=model, light=model)
+    monkeypatch.setattr(research, "get_models", lambda _name=None: namespace)
+    update = research.conduct_research(research_state(model_profile="quality", started_at=None))
+    return update["analyst_stats"][0]
+
+
+def test_rejected_api_key_fails_the_analyst_loudly(monkeypatch) -> None:
+    rejected = {"error": ValueError("Error 401: Unauthorized: missing or invalid API key.")}
+    monkeypatch.setattr(TavilySearch, "_run", lambda self, *args, **kwargs: rejected)
+    stats = run_analyst_with_tool(monkeypatch, ToolCallingModel())
+    assert stats["status"] == "failed"
+    assert stats["stop_reason"] == "auth: tavily_search"
+
+
+def test_tool_failures_are_counted_not_hidden(monkeypatch) -> None:
+    from src.utils import tools as tool_module
+
+    class WikipediaModel(ToolCallingModel):
+        tool = "wikipedia"
+
+    monkeypatch.setattr(
+        tool_module.WikipediaEvidenceTool,
+        "_run",
+        lambda self, query, run_manager=None: "Wikipedia search failed: HTTP 429",
+    )
+    stats = run_analyst_with_tool(monkeypatch, WikipediaModel())
+    assert stats["status"] == "completed"
+    assert stats["tool_calls"] > 0
+    assert stats["tool_errors"] == {"wikipedia": stats["tool_calls"]}
+
+
+def test_tavily_api_errors_read_as_failures_not_evidence(monkeypatch) -> None:
+    from src.utils.tools import auth_failure, tool_failure
+
+    rejected = {"error": ValueError("Error 401: Unauthorized: missing or invalid API key.")}
+    monkeypatch.setattr(TavilySearch, "_run", lambda self, *args, **kwargs: rejected)
+    output = BoundedTavilySearch(max_results=3)._run(query="q")
+    assert output.startswith("Tavily search failed:")
+    assert tool_failure(output) and auth_failure("tavily_search", output)
+    # A site refusing a scraper is not a credentials problem.
+    blocked = "Webpage scrape failed: Client error '403 Forbidden'"
+    assert tool_failure(blocked) and auth_failure("scrape_webpage", blocked) is None
+    # An empty search is a normal outcome.
+    assert tool_failure("No search results found for 'q'", status="error") is None
+
+
+def test_finalize_report_records_uncovered_requirements_and_notes_tool_failures() -> None:
+    stats = [
+        {
+            "analyst": "A",
+            "status": "completed",
+            "stop_reason": "max_passes",
+            "duration_seconds": 1.0,
+            "llm_calls": 3,
+            "input_tokens": 10,
+            "requirements_covered": ["Costs"],
+            "tool_calls": 4,
+            "tool_errors": {"wikipedia": 3},
+        },
+        {
+            "analyst": "B",
+            "status": "failed",
+            "stop_reason": "auth: tavily_search",
+            "duration_seconds": 1.0,
+            "llm_calls": 1,
+            "input_tokens": 5,
+        },
+    ]
+    update = nodes.finalize_report(
+        {
+            "topic": "T",
+            "requirements": ["Costs", "Safety"],
+            "content": "## Insights" + chr(10) + "Body",
+            "introduction": "# T",
+            "conclusion": "## Conclusion",
+            "analyst_stats": stats,
+        }
+    )
+    report, run_stats = update["final_report"], update["run_stats"]
+    assert run_stats["uncovered_requirements"] == ["Safety"]
+    assert run_stats["tool_errors"] == {"wikipedia": 3}
+    # The report writer states requirement gaps; an appended note could contradict the body.
+    assert "Safety" not in report
+    assert "3 of 4 research tool calls failed" in report
+    assert "tavily_search rejected its API key" in report
+    assert "research failed for B" in report

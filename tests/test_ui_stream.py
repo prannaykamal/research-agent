@@ -91,4 +91,6 @@ def test_profiles_endpoint_describes_both_profiles(web: TestClient) -> None:
     assert set(payload["profiles"]) == {"quality", "fast"}
     fast = payload["profiles"]["fast"]
     assert "pubmed" in fast["allowed_tools"] and "scrape_webpage" not in fast["allowed_tools"]
-    assert fast["deadline_seconds"] == 150
+    assert fast["deadline_seconds"] == 300
+    assert fast["max_passes"] == 3 and fast["max_tool_calls_per_pass"] == 6
+    assert fast["models"]["panel"]["model"] == "gemini-3.8-flash"

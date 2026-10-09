@@ -17,17 +17,20 @@ from langgraph.types import Command
 
 import src.analyst_research as research
 import src.deep_agent as deep_agent
+import src.utils.models as models
 import src.utils.nodes as nodes
 from src.utils.models import RateLimitedRunnable
 from src.utils.objects import (
     Analyst,
     Perspectives,
+    QuestionRequirements,
     ResearchEvaluation,
     ResearchFindingBatch,
     ResearchPlan,
 )
 
 LATENCY_SECONDS = 0.2
+REQUIREMENT = "Storage cost"
 
 
 class SlowModel:
@@ -46,13 +49,21 @@ class SlowModel:
     def invoke(self, _messages, *args, **kwargs):
         time.sleep(LATENCY_SECONDS)
         if self.schema is Perspectives:
+            # Every analyst owns the same requirement, so each does identical work.
             return Perspectives(
                 analysts=[
-                    Analyst(affiliation=f"Org {index}", name=f"Analyst {index}", role="Role", description="D")
+                    Analyst(
+                        affiliation=f"Org {index}",
+                        name=f"Analyst {index}",
+                        role="Role",
+                        description="D",
+                        requirements=[REQUIREMENT],
+                    )
                     for index in range(10)
                 ]
             )
         parsed = {
+            QuestionRequirements: lambda: QuestionRequirements(requirements=[REQUIREMENT]),
             ResearchPlan: lambda: ResearchPlan(sub_questions=["Question one", "Question two"]),
             ResearchEvaluation: lambda: ResearchEvaluation(is_complete=True, feedback="Done"),
             ResearchFindingBatch: lambda: ResearchFindingBatch(findings=[]),
@@ -65,11 +76,16 @@ class SlowModel:
 @pytest.fixture
 def stub_models(monkeypatch):
     run_id = uuid.uuid4().hex  # fresh quota windows for each test
+    # Stub model IDs fall back to the default quota, which is sized for one real
+    # model and throttles ten deep analysts making ~17 calls each in seconds.
+    # Real profiles are checked separately by capacity_warnings().
+    monkeypatch.setattr(models, "FALLBACK_MODEL_QUOTA", (100_000_000, 100_000))
     namespace = SimpleNamespace(
         heavy=RateLimitedRunnable(SlowModel(), f"stub-heavy-{run_id}"),
         medium=RateLimitedRunnable(SlowModel(), f"stub-medium-{run_id}"),
         writer=RateLimitedRunnable(SlowModel(), f"stub-medium-{run_id}"),
         light=RateLimitedRunnable(SlowModel(), f"stub-light-{run_id}"),
+        panel=RateLimitedRunnable(SlowModel(), f"stub-heavy-{run_id}"),
     )
     monkeypatch.setattr(research, "get_models", lambda _name=None: namespace)
     monkeypatch.setattr(nodes, "get_models", lambda _name=None: namespace)
