@@ -4,5 +4,8 @@
     "create_analysts": "./src/agent.py:graph",
     "deep_agent": "./src/deep_agent.py:graph"
   },
+  "http": {
+    "app": "./src/webapp.py:app"
+  },
   "env": ".env"
 }

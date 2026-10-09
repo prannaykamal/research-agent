@@ -33,6 +33,7 @@ class AnalystResearchState(TypedDict):
 
     topic: str
     analyst: Analyst
+    analyst_index: NotRequired[int]
     model_profile: NotRequired[ProfileName]
     sub_questions: List[str]
     question_history: Annotated[List[str], operator.add]

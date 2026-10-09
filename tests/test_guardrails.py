@@ -1,9 +1,12 @@
+import json
 import socket
+import uuid
 import time
 from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.runnables import RunnableLambda
 from langchain_tavily import TavilySearch
 
 import src.analyst_research as research
@@ -247,7 +250,7 @@ def test_planner_falls_back_to_deterministic_questions(monkeypatch) -> None:
 
 def test_analyst_failure_is_isolated(monkeypatch) -> None:
     class Exploding:
-        def invoke(self, _state):
+        def invoke(self, _state, _config=None):
             raise RuntimeError("provider down")
 
     monkeypatch.setattr(research, "analyst_research_graph", Exploding())
@@ -282,3 +285,101 @@ def test_tavily_output_is_bounded(monkeypatch) -> None:
     output = BoundedTavilySearch(max_results=3)._run(query="q")
     assert isinstance(output, str)
     assert len(output) <= MAX_TOOL_OUTPUT_CHARS
+
+
+class WorstCaseModel:
+    """Researcher always wants another tool; the evaluator is never satisfied."""
+
+    def __init__(self, schema=None) -> None:
+        self.schema = schema
+        self.tools_bound = False
+        self.calls = 0
+
+    def with_structured_output(self, schema, **_kwargs):
+        return WorstCaseModel(schema)
+
+    def bind_tools(self, _tools, **_kwargs):
+        model = WorstCaseModel(self.schema)
+        model.tools_bound = True
+        return model
+
+    def invoke(self, _messages, *args, **kwargs):
+        from src.utils.objects import ResearchEvaluation, ResearchFindingBatch, ResearchPlan
+
+        self.calls += 1
+        if self.schema is ResearchPlan:
+            plan = ResearchPlan(sub_questions=[f"Question {uuid.uuid4().hex}", f"Question {uuid.uuid4().hex}"])
+            return {"parsed": plan, "raw": AIMessage(content=""), "parsing_error": None}
+        if self.schema is ResearchEvaluation:
+            verdict = ResearchEvaluation(is_complete=False, coverage_gaps=["gap"], feedback="Dig deeper.")
+            return {"parsed": verdict, "raw": AIMessage(content=""), "parsing_error": None}
+        if self.schema is ResearchFindingBatch:
+            batch = ResearchFindingBatch(findings=[finding(int(uuid.uuid4().int % 10_000))])
+            return {"parsed": batch, "raw": AIMessage(content=""), "parsing_error": None}
+        if self.tools_bound:
+            call = {"name": "wikipedia", "args": {"query": "q"}, "id": uuid.uuid4().hex, "type": "tool_call"}
+            return AIMessage(content="", tool_calls=[call])
+        return AIMessage(content="Draft")
+
+
+@pytest.mark.parametrize("profile_name", ["quality", "fast"])
+def test_worst_case_analyst_finishes_within_the_recursion_limit(monkeypatch, profile_name) -> None:
+    from src.utils import tools as tool_module
+
+    model = WorstCaseModel()
+    namespace = SimpleNamespace(heavy=model, medium=model, writer=model, light=model)
+    monkeypatch.setattr(research, "get_models", lambda _name=None: namespace)
+    monkeypatch.setattr(
+        tool_module.WikipediaEvidenceTool,
+        "_run",
+        lambda self, query, run_manager=None: json.dumps([{"source_url": "https://example.org/a", "excerpt": "x"}]),
+    )
+    # The API server runs the parent graph with LangChain's default recursion_limit of 25,
+    # which a node's nested subgraph inherits; reproduce that here.
+    node = RunnableLambda(research.conduct_research)
+    update = node.invoke(research_state(model_profile=profile_name, started_at=None), {"recursion_limit": 25})
+    stats = update["analyst_stats"][0]
+    assert stats["status"] == "completed", stats["stop_reason"]
+    assert stats["stop_reason"] == "max_passes"
+
+
+def test_arxiv_tool_uses_the_current_arxiv_client(monkeypatch) -> None:
+    import datetime
+
+    import arxiv
+
+    from src.utils.tools import ArxivEvidenceTool
+
+    result = arxiv.Result(
+        entry_id="http://arxiv.org/abs/2401.00001v1",
+        updated=datetime.datetime(2024, 1, 1),
+        title="A paper",
+        authors=[arxiv.Result.Author("Ada Lovelace")],
+        summary="We measure things.",
+    )
+    seen = {}
+
+    def fake_results(self, search, offset=0):
+        seen["query"] = search.query
+        return iter([result])
+
+    monkeypatch.setattr(arxiv.Client, "results", fake_results)
+    output = json.loads(ArxivEvidenceTool()._run("grid storage"))
+    assert seen["query"] == "grid storage"
+    assert output == [
+        {
+            "source_title": "A paper",
+            "source_url": "http://arxiv.org/abs/2401.00001v1",
+            "excerpt": "We measure things.",
+            "source_type": "arxiv",
+        }
+    ]
+
+
+def test_wikipedia_requests_identify_this_project() -> None:
+    import wikipedia.wikipedia as wikipedia_client
+
+    from src.utils.tools import USER_AGENT
+
+    assert wikipedia_client.USER_AGENT == USER_AGENT
+    assert "research-agent" in USER_AGENT

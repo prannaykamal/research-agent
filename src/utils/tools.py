@@ -4,7 +4,9 @@ import socket
 from typing import Any, Iterable
 from urllib.parse import urljoin, urlsplit
 
+import arxiv
 import httpx
+import wikipedia
 from bs4 import BeautifulSoup
 from langchain_community.tools.arxiv import ArxivQueryRun
 from langchain_community.tools.pubmed.tool import PubmedQueryRun
@@ -18,7 +20,11 @@ MAX_TOOL_OUTPUT_CHARS = 12_000
 MAX_SCRAPE_BYTES = 2_000_000
 MAX_SCRAPE_REDIRECTS = 3
 SCRAPE_TIMEOUT_SECONDS = 15.0
-SCRAPE_USER_AGENT = "research-agent/0.1 (+https://github.com/prannaykamal/research-agent)"
+USER_AGENT = "research-agent/0.1 (+https://github.com/prannaykamal/research-agent)"
+
+# Wikimedia rate-limits the wikipedia library's generic, shared User-Agent (HTTP 429);
+# its API policy asks clients to identify themselves.
+wikipedia.set_user_agent(USER_AGENT)
 
 
 def _bounded(value: Any, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
@@ -73,23 +79,36 @@ class WikipediaEvidenceTool(WikipediaQueryRun):
 
 
 class ArxivEvidenceTool(ArxivQueryRun):
-    """Standard ArxivQueryRun with result metadata retained in tool output."""
+    """ArxivQueryRun searching through the current arxiv client API.
+
+    langchain-community's wrapper still calls ``Search.results()``, which arxiv
+    4.x removed, so the search runs through ``arxiv.Client`` here. A client per
+    call means parallel analysts never queue behind its request delay.
+    """
 
     name: str = "arxiv"
 
     def _run(self, query: str, run_manager=None) -> str:
         try:
-            documents = self.api_wrapper.get_summaries_as_docs(query)
-            limit = _excerpt_limit(len(documents))
+            wrapper = self.api_wrapper
+            if wrapper.is_arxiv_identifier(query):
+                search = arxiv.Search(id_list=query.split(), max_results=wrapper.top_k_results)
+            else:
+                search = arxiv.Search(
+                    query[: wrapper.ARXIV_MAX_QUERY_LENGTH], max_results=wrapper.top_k_results
+                )
+            client = arxiv.Client(page_size=wrapper.top_k_results, num_retries=1)
+            results = list(client.results(search))
+            limit = _excerpt_limit(len(results))
             payload = [
                 _source_payload(
-                    title=document.metadata.get("Title", "arXiv paper"),
-                    url=document.metadata.get("Entry ID", ""),
-                    excerpt=document.page_content,
+                    title=result.title or "arXiv paper",
+                    url=result.entry_id,
+                    excerpt=result.summary,
                     source_type="arxiv",
                     limit=limit,
                 )
-                for document in documents
+                for result in results
             ]
             return json.dumps(payload)
         except Exception as exc:
@@ -155,7 +174,7 @@ def _fetch_public_page(url: str) -> tuple[str, str]:
     with httpx.Client(
         follow_redirects=False,
         timeout=SCRAPE_TIMEOUT_SECONDS,
-        headers={"User-Agent": SCRAPE_USER_AGENT},
+        headers={"User-Agent": USER_AGENT},
     ) as client:
         for _ in range(MAX_SCRAPE_REDIRECTS + 1):
             with client.stream("GET", current) as response:

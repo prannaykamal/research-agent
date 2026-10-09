@@ -13,6 +13,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
+from langgraph.config import get_stream_writer
 from langgraph.errors import GraphBubbleUp
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
@@ -79,6 +80,30 @@ def _usage_update() -> dict[str, int]:
     if meter is None:
         return {}
     return {"llm_calls": meter.calls, "input_tokens": meter.input_tokens}
+
+
+def _emit(event: dict[str, Any]) -> None:
+    """Publish a small UI progress event.
+
+    LangGraph makes the writer a no-op unless a client streams "custom" events,
+    so this never adds work to a run nobody is watching.
+    """
+    try:
+        writer = get_stream_writer()
+    except RuntimeError:  # called outside a graph run, e.g. in unit tests
+        return
+    writer(event)
+
+
+def _emit_step(state: AnalystResearchState, node: str, **details: Any) -> None:
+    _emit(
+        {
+            "type": "analyst_step",
+            "analyst_index": state.get("analyst_index"),
+            "node": node,
+            **details,
+        }
+    )
 
 
 def _json(value: Any) -> str:
@@ -281,6 +306,24 @@ def _fallback_questions(state: AnalystResearchState) -> list[str]:
 def planner_node(state: AnalystResearchState) -> dict[str, Any]:
     """Create a fresh, non-overlapping research pass and clear tool transcripts."""
     analyst = _analyst(state["analyst"])
+    if state["loop_count"] == 0:
+        profile = _profile(state)
+        _emit(
+            {
+                "type": "analyst_started",
+                "analyst_index": state.get("analyst_index"),
+                "analyst": analyst.model_dump(),
+                "profile": profile.name,
+                "limits": {
+                    "max_passes": profile.max_research_loops,
+                    "max_tool_calls_per_pass": profile.max_tool_calls_per_pass,
+                    "max_researcher_turns": profile.max_researcher_turns,
+                    "deadline_seconds": profile.analyst_deadline_seconds,
+                    "allowed_tools": list(profile.allowed_tools),
+                },
+            }
+        )
+    _emit_step(state, "planner_node", research_pass=state["loop_count"] + 1)
     planner_input = {
         "topic": state["topic"],
         "analyst": analyst.model_dump(),
@@ -359,6 +402,12 @@ def _researcher_view(messages: list[Any], view_chars: int) -> list[Any]:
 def researcher_node(state: AnalystResearchState) -> dict[str, Any]:
     """Use tools only to answer the Planner's current research questions."""
     profile = _profile(state)
+    _emit_step(
+        state,
+        "researcher_node",
+        research_pass=state["loop_count"] + 1,
+        turn=state.get("researcher_turns", 0) + 1,
+    )
     bound_llm = _models(state).medium.bind_tools(list(_profile_tools(profile.name)))
     response = bound_llm.invoke(
         [
@@ -435,6 +484,12 @@ def extract_findings(state: AnalystResearchState) -> dict[str, Any]:
     )
     if not tool_outputs:
         return {"loop_count": state["loop_count"] + 1}
+    _emit_step(
+        state,
+        "extract_findings",
+        research_pass=state["loop_count"] + 1,
+        tool_outputs=len(tool_outputs),
+    )
     extraction_input = {
         "topic": state["topic"],
         "analyst": _analyst(state["analyst"]).model_dump(),
@@ -501,6 +556,7 @@ def evaluate_research(state: AnalystResearchState) -> dict[str, Any]:
     if state["loop_count"] >= profile.max_research_loops or analyst_stop_reason(state, profile):
         # The Writer runs next regardless of the verdict, so skip the heavy call.
         return {}
+    _emit_step(state, "evaluate_research", research_pass=state["loop_count"])
     analyst = _analyst(state["analyst"])
     structured_llm = _models(state).heavy.with_structured_output(
         ResearchEvaluation, include_raw=True
@@ -561,6 +617,7 @@ def writer_node(state: AnalystResearchState) -> dict[str, Any]:
     profile = _profile(state)
     analyst = _analyst(state["analyst"])
     stop_reason = _final_stop_reason(state, profile)
+    _emit_step(state, "writer_node", stop_reason=stop_reason)
     response = _models(state).writer.invoke(
         [
             SystemMessage(
@@ -630,6 +687,18 @@ def build_analyst_research_graph():
 analyst_research_graph = build_analyst_research_graph()
 
 
+def analyst_recursion_limit(profile: ResearchProfile) -> int:
+    """Supersteps a worst-case analyst can take under its profile's guardrails.
+
+    Each pass is the planner, up to ``max_researcher_turns`` rounds of
+    researcher -> limit_tool_calls -> tool_node, extraction and evaluation; the
+    writer runs once at the end. A small margin covers routing at the limits.
+    The API server's default of 25 is too low for Deep Research.
+    """
+    per_pass = 3 + 3 * profile.max_researcher_turns
+    return profile.max_research_loops * per_pass + 1 + 5
+
+
 def conduct_research(state: dict[str, Any]) -> dict[str, Any]:
     """Run one isolated analyst subgraph in its own quota slot.
 
@@ -645,7 +714,8 @@ def conduct_research(state: dict[str, Any]) -> dict[str, Any]:
         sections: list[str] = []
         try:
             result = analyst_research_graph.invoke(
-                {**state, "model_profile": profile_name, "started_at": started_at}
+                {**state, "model_profile": profile_name, "started_at": started_at},
+                {"recursion_limit": analyst_recursion_limit(get_profile(profile_name))},
             )
             sections = [result["draft"]]
             status, stop_reason, findings = "completed", result.get("stop_reason"), len(
@@ -658,6 +728,7 @@ def conduct_research(state: dict[str, Any]) -> dict[str, Any]:
             status, stop_reason, findings = "failed", f"error: {type(exc).__name__}: {exc}", 0
         finished_at = time.time()
     stats = {
+        "analyst_index": state.get("analyst_index"),
         "analyst": analyst.name,
         "role": analyst.role,
         "profile": profile_name,

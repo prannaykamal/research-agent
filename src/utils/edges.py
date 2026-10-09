@@ -22,6 +22,7 @@ def initiate_all_research(state: ResearchGraphState):
             {
                 "topic": state["topic"],
                 "analyst": analyst,
+                "analyst_index": index,
                 "model_profile": profile,
                 "sub_questions": [],
                 "question_history": [],
@@ -39,5 +40,5 @@ def initiate_all_research(state: ResearchGraphState):
                 "stop_reason": None,
             },
         )
-        for analyst in state["analysts"]
+        for index, analyst in enumerate(state["analysts"])
     ]
