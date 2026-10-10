@@ -11,9 +11,11 @@ from src.utils.guardrails import (
     MAX_SECTION_CHARS,
     MAX_SYNTHESIS_INPUT_CHARS,
     MAX_TOOL_ERROR_SHARE,
+    UnresearchableTopicError,
     assign_requirements,
     clip_text,
     uncovered_requirements,
+    unresearchable_topic_message,
     validate_max_analysts,
 )
 from src.utils.objects import Perspectives, QuestionRequirements
@@ -116,6 +118,10 @@ def _question_requirements(state: GenerateAnalystsState, profile_name: str) -> l
         ]
     )
     parsed = result.get("parsed") if isinstance(result, dict) else None
+    # Only an explicit verdict rejects; an unparsable reply falls through leniently.
+    if isinstance(parsed, QuestionRequirements) and not parsed.researchable:
+        logger.info("Rejected topic %r: %s", state["topic"], parsed.reason)
+        raise UnresearchableTopicError(unresearchable_topic_message(state["topic"]))
     requirements: list[str] = []
     if isinstance(parsed, QuestionRequirements):
         for requirement in parsed.requirements:
@@ -133,8 +139,10 @@ def _shortest_persona(analysts: list) -> int:
 
 
 def create_analysts(state: GenerateAnalystsState):
-    max_analysts = validate_max_analysts(state["max_analysts"])
     profile_name = _profile_name(state)
+    max_analysts = validate_max_analysts(
+        state["max_analysts"], get_profile(profile_name).max_analysts
+    )
     requirements = _question_requirements(state, profile_name)
     structured_llm = get_models(profile_name).panel.with_structured_output(Perspectives)
     system_message = dated(

@@ -7,7 +7,7 @@ import threading
 from dataclasses import dataclass
 from typing import Literal, get_args
 
-from src.utils.guardrails import MAX_CONCURRENT_ANALYSTS, MAX_FINDINGS_PER_ANALYST
+from src.utils.guardrails import MAX_ANALYSTS, MAX_CONCURRENT_ANALYSTS, MAX_FINDINGS_PER_ANALYST
 from src.utils.models import (
     SAFETY_MARGIN,
     ModelTier,
@@ -50,6 +50,9 @@ class ResearchProfile:
     allowed_tools: tuple[str, ...]
     # Shortest realistic research pass; only used for the capacity estimate.
     min_pass_seconds: float
+    # Most analysts a run may request; Deep Research caps lower because each of its
+    # analysts costs far more and a question has at most MAX_REQUIREMENTS to divide.
+    max_analysts: int
 
 
 def _tier(
@@ -98,6 +101,7 @@ def _build_profiles() -> dict[str, ResearchProfile]:
         writer_word_target=600,
         allowed_tools=ALL_TOOLS,
         min_pass_seconds=30.0,
+        max_analysts=5,
     )
     fast = ResearchProfile(
         name="fast",
@@ -122,6 +126,7 @@ def _build_profiles() -> dict[str, ResearchProfile]:
         writer_word_target=500,
         allowed_tools=("tavily_search", "wikipedia", "arxiv", "pubmed"),
         min_pass_seconds=15.0,
+        max_analysts=MAX_ANALYSTS,
     )
     return {"quality": quality, "fast": fast}
 

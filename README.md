@@ -26,7 +26,7 @@ inherit its reconciled figures and hedges.
 | Field | Values | Default |
 | --- | --- | --- |
 | `topic` | Research topic | required |
-| `max_analysts` | Integer, **1–10** | required |
+| `max_analysts` | Integer, **1–10** (**1–5** for `quality`) | required |
 | `model_profile` | `quality` or `fast` | `quality` |
 
 ## Model profiles
@@ -101,7 +101,8 @@ The warning includes the TPM and RPM you would need.
 
 ### System-wide
 
-- `max_analysts` must be between 1 and 10. The generated panel is trimmed to exactly that number.
+- The topic must name something to research. The question-split call also judges the input, leniently, before any analyst is created and with no extra model call. Greetings, lone numbers or words, calculations and one-line facts are refused. The UI then shows a "Research topic is not relevant" section with three example questions, drawn at random from the evaluation questions; choosing one fills the topic box.
+- `max_analysts` must be between 1 and 10 for Quick Research and between 1 and 5 for Deep Research, whose analysts cost far more and would mostly split the same requirements. The generated panel is trimmed to exactly that number.
 - At most 3 analyst-panel revisions; after that, the current panel is used.
 - At most 10 analysts run at once across all runs in the process.
 - TPM and RPM limits are enforced per model ID. Provider-side retries are disabled, so every attempt passes the limiters.
@@ -134,7 +135,7 @@ A single-page UI (`frontend/`, no build step) served by the LangGraph server its
 `http.app` in `langgraph.json` (`src/webapp.py`).
 
 **Research Orchestrator (main chat).** Configure the topic, the number of perspectives
-(1–10), and the research mode: the toggle switches between **Quick Research** (`fast`) and
+(1–10, or 1–5 in Deep Research; switching modes clamps the count), and the research mode: the toggle switches between **Quick Research** (`fast`) and
 **Deep Research** (`quality`), and its `?` lists each mode's cost, latency, models, passes,
 tools and deadline. Sections are appended as the graph runs:
 
@@ -145,7 +146,9 @@ tools and deadline. Sections are appended as the graph runs:
   same moment one chat per analyst appears in the sidebar.
 - **Final report** is appended when `finalize_report` finishes, with a Markdown export,
   followed by a separate **Run statistics** section (per-analyst status, stop reason,
-  duration, LLM calls, input tokens and findings).
+  duration, LLM calls, input tokens and findings). The chat follows new content as it
+  arrives, except here: it stops at the report, with its heading at the top of the view,
+  and leaves Run statistics below for the reader to scroll to.
 
 **Analyst chats.** Each analyst gets its own chat that appends sections as its subgraph runs:
 

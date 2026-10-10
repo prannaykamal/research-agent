@@ -113,7 +113,10 @@ def test_create_analysts_returns_exactly_the_requested_count(monkeypatch) -> Non
 def test_create_analysts_rejects_out_of_range_before_calling_a_model(monkeypatch) -> None:
     use_node_models(monkeypatch, None)
     with pytest.raises(ValueError, match="between 1 and 10"):
-        nodes.create_analysts({"topic": "T", "max_analysts": 11})
+        nodes.create_analysts({"topic": "T", "max_analysts": 11, "model_profile": "fast"})
+    # The default profile is Deep Research, which caps the panel at 5.
+    with pytest.raises(ValueError, match="between 1 and 5"):
+        nodes.create_analysts({"topic": "T", "max_analysts": 6})
 
 
 def test_create_analysts_rejects_unknown_profile(monkeypatch) -> None:

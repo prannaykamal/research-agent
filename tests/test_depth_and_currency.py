@@ -404,3 +404,81 @@ def test_finalize_drops_a_bare_report_heading() -> None:
         }
     )
     assert "## Report" not in update["final_report"] and "### Part" in update["final_report"]
+
+
+# Per-profile analyst caps
+
+
+def test_deep_research_allows_at_most_five_analysts(monkeypatch) -> None:
+    import pytest
+
+    use_recorder(monkeypatch)
+    with pytest.raises(ValueError, match="between 1 and 5"):
+        nodes.create_analysts({"topic": "T", "max_analysts": 6, "model_profile": "quality"})
+    assert nodes.create_analysts({"topic": "T", "max_analysts": 5, "model_profile": "quality"})["analysts"]
+
+
+def test_quick_research_still_allows_ten_analysts() -> None:
+    from src.utils.guardrails import validate_max_analysts
+    from src.utils.profiles import get_profile
+
+    assert validate_max_analysts(10, get_profile("fast").max_analysts) == 10
+    assert get_profile("quality").max_analysts == 5
+
+
+# Topic check
+
+
+class TopicModel:
+    """Answers the question split with a fixed verdict and counts persona calls."""
+
+    def __init__(self, verdict) -> None:
+        self.verdict = verdict
+        self.schema = None
+        self.persona_calls = 0
+
+    def with_structured_output(self, schema, **_kwargs):
+        self.schema = schema
+        return self
+
+    def invoke(self, _messages):
+        if self.schema is QuestionRequirements:
+            return {"parsed": self.verdict, "raw": AIMessage(content=""), "parsing_error": None}
+        self.persona_calls += 1
+        return Perspectives(
+            analysts=[Analyst(affiliation="A", name="N", role="R", description=LONG_DESCRIPTION)]
+        )
+
+
+def test_a_topic_with_nothing_to_research_is_rejected_before_any_persona(monkeypatch) -> None:
+    import pytest
+
+    from src.utils.guardrails import UnresearchableTopicError
+
+    model = TopicModel(QuestionRequirements(researchable=False, reason="greeting"))
+    use_panel(monkeypatch, model)
+    with pytest.raises(UnresearchableTopicError, match='"hi" does not name a subject'):
+        nodes.create_analysts({"topic": "hi", "max_analysts": 1})
+    assert model.persona_calls == 0
+
+
+def test_researchable_topics_and_unparsable_verdicts_proceed(monkeypatch) -> None:
+    for verdict in (QuestionRequirements(requirements=["Costs"]), None):
+        model = TopicModel(verdict)
+        use_panel(monkeypatch, model)
+        update = nodes.create_analysts({"topic": "Blockchain", "max_analysts": 1})
+        assert model.persona_calls == 1 and update["analysts"]
+
+
+def test_a_panel_revision_never_rechecks_the_topic(monkeypatch) -> None:
+    model = TopicModel(QuestionRequirements(researchable=False))
+    use_panel(monkeypatch, model)
+    update = nodes.create_analysts({"topic": "hi", "max_analysts": 1, "requirements": ["Costs"]})
+    assert update["requirements"] == ["Costs"] and model.persona_calls == 1
+
+
+def test_a_long_rejected_topic_is_shortened_in_the_message() -> None:
+    from src.utils.guardrails import unresearchable_topic_message
+
+    message = unresearchable_topic_message("x" * 200)
+    assert message.startswith('"' + "x" * 59 + '…"')

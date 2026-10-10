@@ -31,6 +31,9 @@ TRUNCATION_MARKER = " […]"
 # A run whose research tool calls mostly failed gets a coverage note.
 MAX_TOOL_ERROR_SHARE = 0.5
 
+# A rejected topic is echoed back in the error, shortened to this many characters.
+MAX_TOPIC_ECHO_CHARS = 60
+
 # Evidence newer than this counts as current for status claims.
 RECENT_EVIDENCE_DAYS = 365
 _SOURCE_DATE = re.compile(r"^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$")
@@ -44,16 +47,35 @@ _REQUIREMENT_STOPWORDS = frozenset(
 )
 
 
-def validate_max_analysts(value: Any) -> int:
-    """Return a valid analyst count or raise a clear error for the caller."""
+class UnresearchableTopicError(ValueError):
+    """The topic names nothing to research (a greeting, a test string, gibberish).
+
+    A ValueError subclass so the API server streams its message and class name, which the
+    UI uses to show the message in the configuration form instead of as a failed run.
+    """
+
+
+def unresearchable_topic_message(topic: str) -> str:
+    shown = " ".join(topic.split())
+    if len(shown) > MAX_TOPIC_ECHO_CHARS:
+        shown = shown[: MAX_TOPIC_ECHO_CHARS - 1].rstrip() + "…"
+    return f'"{shown}" does not name a subject or question to research.'
+
+
+def validate_max_analysts(value: Any, maximum: int = MAX_ANALYSTS) -> int:
+    """Return a valid analyst count or raise a clear error for the caller.
+
+    ``maximum`` is the selected profile's own cap, never above ``MAX_ANALYSTS``.
+    """
+    maximum = min(maximum, MAX_ANALYSTS)
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(
             f"max_analysts must be an integer between {MIN_ANALYSTS} and "
-            f"{MAX_ANALYSTS}; got {value!r}."
+            f"{maximum}; got {value!r}."
         )
-    if not MIN_ANALYSTS <= value <= MAX_ANALYSTS:
+    if not MIN_ANALYSTS <= value <= maximum:
         raise ValueError(
-            f"max_analysts must be between {MIN_ANALYSTS} and {MAX_ANALYSTS}; got {value}."
+            f"max_analysts must be between {MIN_ANALYSTS} and {maximum}; got {value}."
         )
     return value
 

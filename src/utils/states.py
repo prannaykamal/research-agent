@@ -12,7 +12,7 @@ from src.utils.profiles import ProfileName
 
 
 class ResearchInput(TypedDict):
-    """Run input: max_analysts must be 1–10; model_profile defaults to "quality"."""
+    """Run input: max_analysts must be 1–10 (1–5 for "quality"); model_profile defaults to "quality"."""
 
     topic: str
     max_analysts: Annotated[int, Field(ge=MIN_ANALYSTS, le=MAX_ANALYSTS)]

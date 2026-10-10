@@ -31,6 +31,7 @@ def _profile_summary(name: str) -> dict:
         "max_researcher_turns": profile.max_researcher_turns,
         "deadline_seconds": profile.analyst_deadline_seconds,
         "allowed_tools": list(profile.allowed_tools),
+        "max_analysts": profile.max_analysts,
     }
 
 

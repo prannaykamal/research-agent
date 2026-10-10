@@ -131,3 +131,14 @@ test("message text flattens Gemini content parts", () => {
   assert.equal(messageText([{ type: "text", text: "a" }, "b", { type: "image" }]), "ab");
   assert.equal(messageText(null), "");
 });
+
+test("a rejected topic becomes a form error; any other failure stays a run error", () => {
+  const interpret = createInterpreter();
+  const message = '"hi" is not a research topic.';
+  assert.deepEqual(interpret({ event: "error", data: { error: "UnresearchableTopicError", message } }), [
+    { kind: "topic_rejected", message },
+  ]);
+  assert.deepEqual(interpret({ event: "error", data: { error: "ValueError", message: "boom" } }), [
+    { kind: "run_error", message: "boom" },
+  ]);
+});

@@ -26,6 +26,7 @@ const FALLBACK_META = {
       max_researcher_turns: 3,
       deadline_seconds: 400,
       allowed_tools: Object.keys(TOOL_INFO),
+      max_analysts: 5,
     },
     fast: {
       models: { heavy: { model: "gemini-3.8-flash" }, medium: { model: "gemini-3.5-flash-lite" } },
@@ -34,6 +35,7 @@ const FALLBACK_META = {
       max_researcher_turns: 3,
       deadline_seconds: 300,
       allowed_tools: ["tavily_search", "wikipedia", "arxiv", "pubmed"],
+      max_analysts: 10,
     },
   },
 };
@@ -193,6 +195,8 @@ function clearRun() {
 
 async function startRun(values) {
   app.values = values;
+  app.rejection?.remove();
+  app.rejection = null;
   clearRun();
   config.lock();
   orchestrator.origin = performance.now();
@@ -230,7 +234,7 @@ async function stream(payload) {
 }
 
 function streamClosed() {
-  if (["awaiting_feedback", "complete", "error", "cancelled"].includes(app.phase)) return;
+  if (["awaiting_feedback", "complete", "error", "cancelled", "config"].includes(app.phase)) return;
   fail("The run ended without a final report. Check the LangGraph server logs for details.");
 }
 
@@ -245,6 +249,7 @@ const HANDLERS = {
     app.runId = runId;
   },
   run_error: ({ message }) => fail(message),
+  topic_rejected: ({ message }) => rejectTopic(message),
   analysts_generated: ({ analysts }) => {
     app.latestAnalysts = analysts;
   },
@@ -577,8 +582,10 @@ function onFinalReport({ report, runStats }) {
   app.pending.synthesis?.update({ status: "done" });
   app.pending.synthesis = null;
   orchestrator.step({ status: "done", text: "Final report assembled" });
-  orchestrator.appendSection(views.finalReportSection(report));
+  const reportSection = orchestrator.appendSection(views.finalReportSection(report));
   if (runStats) orchestrator.appendSection(views.runStatsSection(runStats));
+  // Open on the report's heading rather than scrolling past it to the run statistics.
+  orchestrator.reveal(reportSection);
   app.tracker?.setStatus("Complete", "ok", true);
   if (app.active !== "orchestrator") app.attention = true;
   setPhase("complete");
@@ -622,6 +629,19 @@ async function resetToConfig() {
   clearRun();
   setPhase("config");
   buildOrchestrator(values);
+}
+
+// Back to an editable form with the entered values, plus a section explaining the refusal
+// and suggesting questions; choosing one fills the topic box.
+function rejectTopic(message) {
+  const { values } = app;
+  clearRun();
+  setPhase("config");
+  buildOrchestrator(values);
+  app.rejection = orchestrator.appendSection(
+    views.topicRejectedSection({ message, onPick: (question) => config.setTopic(question) }),
+  );
+  config.focusTopic();
 }
 
 function fail(message) {

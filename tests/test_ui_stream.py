@@ -94,3 +94,6 @@ def test_profiles_endpoint_describes_both_profiles(web: TestClient) -> None:
     assert fast["deadline_seconds"] == 300
     assert fast["max_passes"] == 3 and fast["max_tool_calls_per_pass"] == 6
     assert fast["models"]["panel"]["model"] == "gemini-3.8-flash"
+    # Deep Research caps the panel lower than Quick Research.
+    assert payload["profiles"]["quality"]["max_analysts"] == 5
+    assert fast["max_analysts"] == 10

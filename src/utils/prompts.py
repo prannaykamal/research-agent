@@ -27,6 +27,19 @@ For a broad question, also name the main dimensions a knowledgeable reader would
 answered. Return between 3 and {max_requirements} short, non-overlapping requirements phrased
 as noun phrases (fewer only if the question is genuinely narrow). Do not research or answer
 them.
+First judge whether the input is something research could address at all: it must name a
+subject (a field, technology, event, place, organisation, phenomenon, policy, or open
+question) that sources could be gathered on. Set `researchable` to false, and leave
+`requirements` empty, when the input has no such subject:
+- a greeting, thanks, or small talk ("hi", "thanks", "how are you");
+- a test string or gibberish ("asdf", "test", "123");
+- a lone number, number word, or everyday word that names no topic ("nine", "yes", "blue");
+- a calculation, conversion, or one-line fact a calculator or dictionary answers
+  ("what's 27*21", "convert 5 km to miles", "how many days are in a week");
+- a request about you rather than the world ("what can you do", "who are you");
+- empty or punctuation-only text.
+Anything that names a subject is researchable, however broad, vague, narrow, or opinion-based
+("blockchain", "AI", "Mars", "is nuclear power safe?"): the user reviews the analyst panel next.
 """
 
 analyst_instructions = """

@@ -5,7 +5,7 @@
 //   updates                       {<orchestrator node>: <update>} or {__interrupt__: [...]}
 //   updates|conduct_research:<id> {<analyst node>: <update>}
 //   custom|conduct_research:<id>  {type: "analyst_started" | "analyst_step", ...}
-//   error                         {error, message}
+//   error                         {error, message}; error is the exception class name
 
 export const SYNTHESIS_STEPS = ["write_report", "write_introduction", "write_conclusion", "finalize_report"];
 
@@ -115,6 +115,8 @@ export function createInterpreter() {
     if (mode === "metadata") return data?.run_id ? [{ kind: "run_started", runId: data.run_id }] : [];
     if (mode === "error") {
       const message = data?.message || data?.error || (typeof data === "string" ? data : "Run failed");
+      // The topic check rejects input before any analyst exists: a form error, not a failed run.
+      if (data?.error === "UnresearchableTopicError") return [{ kind: "topic_rejected", message }];
       return [{ kind: "run_error", message }];
     }
     if (mode === "custom" && namespace && data && typeof data === "object") {

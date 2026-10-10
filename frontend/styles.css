@@ -1339,6 +1339,92 @@ a:hover {
   border-color: #f0c2bd;
 }
 
+/* Topic refused: guidance, not a failure, so amber rather than red. */
+.section-icon.tone-warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.topic-reason {
+  margin: 0 0 14px;
+  color: var(--ink-2);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.suggestions-label {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.suggestions {
+  display: grid;
+  gap: 8px;
+}
+
+/* Every row is exactly two lines tall, so "Other ideas" never changes the section's size;
+   a longer question is clamped and its full text is in the tooltip. */
+.suggestion {
+  --suggestion-lines: 2;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  height: calc(var(--suggestion-lines) * 14px * 1.45 + 24px + 2px);
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--ink);
+  font: 500 14px/1.45 var(--sans);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, transform 0.15s;
+}
+
+.suggestion:hover {
+  border-color: var(--steel-400);
+  background: var(--primary-soft);
+}
+
+.suggestion:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.suggestion-text {
+  flex: 1;
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: var(--suggestion-lines);
+  line-clamp: var(--suggestion-lines);
+}
+
+.suggestion-arrow {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: var(--faint);
+  transition: transform 0.15s, color 0.15s;
+}
+
+.suggestion:hover .suggestion-arrow {
+  color: var(--primary);
+  transform: translateX(3px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .suggestion,
+  .suggestion-arrow {
+    transition: none;
+  }
+}
+
 .cell-name {
   font-weight: 600;
 }

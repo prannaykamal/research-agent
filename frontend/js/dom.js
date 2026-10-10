@@ -54,6 +54,8 @@ const ICONS = {
   swap: '<path d="M7 8h12l-3.5-3.5M17 16H5l3.5 3.5"/>',
   chart: '<path d="M4 20V11M10 20V5M16 20v-6M2.5 20h19"/>',
   minus: '<path d="M5 12h14"/>',
+  bulb: '<path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2.1h5c0-.9.4-1.6 1-2.1A6 6 0 0 0 12 3z"/>',
+  arrowRight: '<path d="M5 12h14M13 6l6 6-6 6"/>',
 };
 
 export function icon(name, className = "icon") {

@@ -30,8 +30,18 @@ class Analyst(BaseModel):
 
 
 class QuestionRequirements(BaseModel):
+    # Declared first so the model judges the input before listing requirements.
+    researchable: bool = Field(
+        default=True,
+        description=(
+            "False only when the input names no subject or question that research could "
+            "address (a greeting, a test string, gibberish); true for anything else."
+        ),
+    )
+    reason: str = Field(default="", description="One short phrase explaining the verdict.")
+    # May be empty when the input is not researchable.
     requirements: List[str] = Field(
-        min_length=1,
+        default_factory=list,
         max_length=MAX_REQUIREMENTS,
         description="Separate, non-overlapping requirements a complete answer must cover.",
     )

@@ -16,10 +16,13 @@ import {
   truncate,
 } from "./dom.js";
 import { renderMarkdown, safeUrl } from "./markdown.js";
+import { pickTopics } from "./suggestions.js";
 
 // ---------------------------------------------------------------- chat + timeline
 
 const reducedMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
+// Breathing room above a revealed section's heading.
+const REVEAL_MARGIN_PX = 16;
 
 // Play the entrance animation once, only for content that arrives while its chat is
 // on screen; content that arrived in a background chat is simply there when opened.
@@ -46,6 +49,7 @@ export class Chat {
     this.savedScroll = 0;
     this.origin = performance.now();
     this.autoScrollUntil = 0;
+    this.anchor = null; // a section to bring to the top the next time this chat is visible
     this.root.addEventListener(
       "scroll",
       () => {
@@ -63,8 +67,11 @@ export class Chat {
   }
 
   show() {
+    const wasHidden = this.root.hidden;
     this.root.hidden = false;
-    if (this.pinned) this.scrollToEnd();
+    if (this.anchor) this.scrollToAnchor();
+    else if (!wasHidden) return; // re-selecting the open chat keeps the reader's position
+    else if (this.pinned) this.scrollToEnd();
     else this.root.scrollTop = this.savedScroll;
   }
 
@@ -92,7 +99,29 @@ export class Chat {
   }
 
   follow() {
-    if (this.pinned && !this.root.hidden) requestAnimationFrame(() => this.scrollToEnd(true));
+    // Re-checked in the frame: a reveal() in the same tick must win over following.
+    if (this.pinned && !this.root.hidden) requestAnimationFrame(() => this.pinned && this.scrollToEnd(true));
+  }
+
+  // Stop following the newest content and bring `element` to the top of the view
+  // instead, now if the chat is visible, otherwise when it is next shown.
+  reveal(element) {
+    this.pinned = false;
+    this.anchor = element;
+    if (!this.root.hidden) requestAnimationFrame(() => this.scrollToAnchor(true));
+  }
+
+  scrollToAnchor(smooth = false) {
+    const element = this.anchor;
+    this.anchor = null;
+    if (!element) return;
+    const behavior = smooth && !reducedMotion() ? "smooth" : "auto";
+    if (behavior === "smooth") this.autoScrollUntil = performance.now() + 700;
+    // Measure the resting position: the entrance animation starts the card shifted down.
+    const transform = getComputedStyle(element).transform;
+    const shift = transform && transform !== "none" ? new DOMMatrixReadOnly(transform).m42 : 0;
+    const offset = element.getBoundingClientRect().top - shift - this.root.getBoundingClientRect().top;
+    this.root.scrollTo({ top: Math.max(0, this.root.scrollTop + offset - REVEAL_MARGIN_PX), behavior });
   }
 
   scrollToEnd(smooth = false) {
@@ -248,20 +277,19 @@ export function configSection({ meta, values, onStart, onReset }) {
     class: "input count-input",
     type: "number",
     min: meta.min_analysts,
-    max: meta.max_analysts,
     step: 1,
     "aria-label": "Number of analysts",
   });
   count.value = values.maxAnalysts ?? 3;
+  // Each mode has its own cap (Deep Research allows fewer analysts than Quick Research).
+  const maxFor = (name) => meta.profiles[name]?.max_analysts ?? meta.max_analysts;
+  const clampCount = (value) => Math.min(maxFor(mode), Math.max(meta.min_analysts, value));
   const stepCount = (delta) => {
-    count.value = Math.min(meta.max_analysts, Math.max(meta.min_analysts, (Number(count.value) || 0) + delta));
+    count.value = clampCount((Number(count.value) || 0) + delta);
   };
   const minus = h("button", { class: "btn btn-icon", type: "button", "aria-label": "Fewer analysts", onclick: () => stepCount(-1) }, icon("minus"));
   const plus = h("button", { class: "btn btn-icon", type: "button", "aria-label": "More analysts", onclick: () => stepCount(1) }, icon("plus"));
-  const countHelp = help(
-    `How many independent perspectives should the research use? Select ${meta.min_analysts}–${meta.max_analysts} analysts; they all run in parallel.`,
-    "About perspectives",
-  );
+  const countHelp = help("", "About perspectives");
 
   // Research mode: one button that toggles between the profiles.
   const names = Object.keys(meta.profiles);
@@ -283,6 +311,11 @@ export function configSection({ meta, values, onStart, onReset }) {
     modeButton.setAttribute("aria-label", `${label}. Click to switch to ${profileLabel(other)}.`);
     modeButton.dataset.mode = next;
     modeHelp.set(modeDetails(next, meta.profiles[next]));
+    count.max = maxFor(next);
+    if (Number(count.value) > maxFor(next)) count.value = maxFor(next);
+    countHelp.set(
+      `How many independent perspectives should the research use? ${label} allows ${meta.min_analysts}–${maxFor(next)} analysts; they all run in parallel.`,
+    );
   }
   modeButton.addEventListener("click", () => setMode(names[(names.indexOf(mode) + 1) % names.length]));
   setMode(mode);
@@ -313,8 +346,8 @@ export function configSection({ meta, values, onStart, onReset }) {
     event.preventDefault();
     const maxAnalysts = Number(count.value);
     if (!topic.value.trim()) return showError("Enter a research topic.");
-    if (!Number.isInteger(maxAnalysts) || maxAnalysts < meta.min_analysts || maxAnalysts > meta.max_analysts) {
-      return showError(`Perspectives must be a whole number from ${meta.min_analysts} to ${meta.max_analysts}.`);
+    if (!Number.isInteger(maxAnalysts) || maxAnalysts < meta.min_analysts || maxAnalysts > maxFor(mode)) {
+      return showError(`${profileLabel(mode)} allows a whole number of perspectives from ${meta.min_analysts} to ${maxFor(mode)}.`);
     }
     showError("");
     onStart({ topic: topic.value.trim(), maxAnalysts, profile: mode });
@@ -338,6 +371,12 @@ export function configSection({ meta, values, onStart, onReset }) {
     lock: () => setLocked(true),
     unlock: () => setLocked(false),
     showError,
+    focusTopic: () => topic.focus(),
+    setTopic: (text) => {
+      topic.value = text;
+      showError("");
+      topic.focus();
+    },
   };
 }
 
@@ -776,6 +815,42 @@ export function runStatsSection(runStats) {
       ),
     );
   }
+  return card.root;
+}
+
+// Shown under the configuration form when the topic names nothing to research. Offers three
+// example questions; choosing one fills the topic box, and "Other ideas" draws three more.
+export function topicRejectedSection({ message, onPick }) {
+  const list = h("div", { class: "suggestions", role: "list" });
+  let shown = [];
+  const draw = () => {
+    shown = pickTopics(3, { exclude: shown });
+    list.replaceChildren(
+      ...shown.map((question) =>
+        h(
+          "button",
+          { class: "suggestion", type: "button", role: "listitem", title: question, onclick: () => onPick(question) },
+          h("span", { class: "suggestion-text" }, question),
+          icon("arrowRight", "icon suggestion-arrow"),
+        ),
+      ),
+    );
+  };
+  const reshuffle = h("button", { class: "btn btn-small", type: "button", onclick: draw }, icon("restart"), "Other ideas");
+  const card = section({
+    icon: "bulb",
+    kicker: "Nothing to research yet",
+    title: "Research topic is not relevant",
+    tone: "warn",
+    actions: [reshuffle],
+    className: "topic-card",
+  });
+  draw();
+  card.body.append(
+    h("p", { class: "topic-reason" }, message),
+    h("p", { class: "suggestions-label" }, "Try a question like one of these:"),
+    list,
+  );
   return card.root;
 }
 
